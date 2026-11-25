@@ -107,7 +107,8 @@ enum class BizzlyTab(val route: String, val label: String) {
     PROD("prod", "Produits"),
     SRV("srv", "Entreprise"),
     QR("qr", "Menu QR"),
-    HIST("hist", "Bilan")
+    HIST("hist", "Bilan"),
+    INVENTORY("inventory", "Inventaire")
 }
 
 val PAYMENT_MODES = listOf("Espèces", "Mobile Money", "Carte bancaire", "Autre")

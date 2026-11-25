@@ -129,7 +129,7 @@ private fun BizzlyRootScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-
+    val lowStockInventory by viewModel.lowStockInventoryItems.collectAsStateWithLifecycle()
 
     val handleCreateDocumentResult: (android.net.Uri?) -> Unit = { uri ->
         val exp = state.readyExport
@@ -200,7 +200,7 @@ private fun BizzlyRootScreen(
         } else {
             val visibleNavTabs = mainNavTabs.filter { viewModel.canTab(it.tab) }
             val activeNavTab = when (state.currentTab) {
-                BizzlyTab.PROD, BizzlyTab.SRV, BizzlyTab.QR, BizzlyTab.HIST -> BizzlyTab.MORE
+                BizzlyTab.PROD, BizzlyTab.SRV, BizzlyTab.QR, BizzlyTab.HIST, BizzlyTab.INVENTORY -> BizzlyTab.MORE
                 else -> state.currentTab
             }
 

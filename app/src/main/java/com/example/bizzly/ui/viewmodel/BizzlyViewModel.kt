@@ -233,11 +233,40 @@ data class BizzlyUiState(
 class BizzlyViewModel(application: Application) : AndroidViewModel(application) {
     private val db = BizzlyDatabase.getInstance(application)
     private val repository = BizzlyRepository(application, db.bizzlyDao())
+    private val inventoryRepository = InventoryRepository(application, db.inventoryDao())
     private val syncClient = SupabaseSyncClient(repository)
     private val lockout = LockoutTracker(application)
 
     private val _uiState = MutableStateFlow(BizzlyUiState())
     val uiState: StateFlow<BizzlyUiState> = _uiState.asStateFlow()
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val inventoryItems: StateFlow<List<InventoryItemEntity>> = uiState
+        .map { it.activeAccount?.id }
+        .distinctUntilChanged()
+        .flatMapLatest { bizId ->
+            if (bizId.isNullOrBlank()) flowOf(emptyList())
+            else inventoryRepository.observeItems(bizId)
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val lowStockInventoryItems: StateFlow<List<InventoryItemEntity>> = uiState
+        .map { it.activeAccount?.id }
+        .distinctUntilChanged()
+        .flatMapLatest { bizId ->
+            if (bizId.isNullOrBlank()) flowOf(emptyList())
+            else inventoryRepository.observeLowStockItems(bizId)
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
 
     private val seenDocVersions = mutableMapOf<String, Long>()
     private var syncDebounceJob: Job? = null
@@ -1336,7 +1365,156 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         showToast("Liste d’exemple chargée")
     }
 
+    // --- Room Inventory Items & Threshold Alerts ---
 
+    fun saveInventoryItem(
+        editingId: Long?,
+        nameRaw: String,
+        skuRaw: String,
+        categoryRaw: String,
+        unitRaw: String,
+        quantityRaw: String,
+        minThresholdRaw: String,
+        unitPriceRaw: String,
+        notesRaw: String
+    ) {
+        if (!requirePermission(BizzlyPermissions.STOCK) {
+                saveInventoryItem(
+                    editingId, nameRaw, skuRaw, categoryRaw, unitRaw,
+                    quantityRaw, minThresholdRaw, unitPriceRaw, notesRaw
+                )
+            }
+        ) return
+        val bizId = _uiState.value.activeAccount?.id ?: return
+        val name = nameRaw.trim().uppercase()
+        if (name.isEmpty()) {
+            showToast("Indiquez un nom d’article.")
+            return
+        }
+        val qty = BizzlyCalculator.clampNumber(quantityRaw.replace(',', '.').toDoubleOrNull() ?: 0.0)
+        val threshold = BizzlyCalculator.clampNumber(
+            minThresholdRaw.replace(',', '.').toDoubleOrNull()
+                ?: _uiState.value.businessData.seuil.toDouble()
+        )
+        val unitPrice = BizzlyCalculator.clampNumber(unitPriceRaw.replace(',', '.').toDoubleOrNull() ?: 0.0)
+
+        viewModelScope.launch {
+            val existing = if (editingId != null) {
+                withContext(Dispatchers.IO) { inventoryRepository.getItemById(editingId) }
+            } else null
+
+            val entity = InventoryItemEntity(
+                id = editingId ?: 0L,
+                businessId = bizId,
+                productId = existing?.productId,
+                name = name,
+                sku = skuRaw.trim(),
+                category = categoryRaw.trim().ifEmpty { "Général" },
+                unit = unitRaw.trim().ifEmpty { "unités" },
+                quantity = qty,
+                minThreshold = threshold,
+                unitPrice = unitPrice,
+                notes = notesRaw.trim()
+            )
+            withContext(Dispatchers.IO) { inventoryRepository.saveItem(entity) }
+            if (entity.isBelowThreshold) {
+                val msg = if (qty <= 0.0) {
+                    "Rupture de stock : $name (${BizzlyCalculator.formatQty(qty)} ${entity.unit})"
+                } else {
+                    "Alerte stock bas : $name (${BizzlyCalculator.formatQty(qty)} < seuil ${BizzlyCalculator.formatQty(threshold)})"
+                }
+                showToast(msg)
+            } else {
+                showToast(if (editingId == null) "Article ajouté : $name" else "Article mis à jour : $name")
+            }
+        }
+    }
+
+    fun adjustInventoryQuantity(itemId: Long, delta: Double) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { adjustInventoryQuantity(itemId, delta) }) return
+        viewModelScope.launch {
+            val before = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
+            val updated = withContext(Dispatchers.IO) { inventoryRepository.adjustQuantity(itemId, delta) } ?: return@launch
+            notifyIfCrossedThreshold(before, updated)
+        }
+    }
+
+    fun setInventoryQuantityAndThreshold(itemId: Long, quantityRaw: String, thresholdRaw: String) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { setInventoryQuantityAndThreshold(itemId, quantityRaw, thresholdRaw) }) return
+        val qty = quantityRaw.replace(',', '.').toDoubleOrNull()
+        val threshold = thresholdRaw.replace(',', '.').toDoubleOrNull()
+        if (qty == null || threshold == null) {
+            showToast("Valeurs numériques invalides.")
+            return
+        }
+        viewModelScope.launch {
+            val before = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
+            withContext(Dispatchers.IO) {
+                inventoryRepository.updateThreshold(itemId, threshold)
+            }
+            val updated = withContext(Dispatchers.IO) {
+                inventoryRepository.setQuantity(itemId, qty)
+            } ?: return@launch
+            notifyIfCrossedThreshold(before, updated)
+        }
+    }
+
+    fun applyDefaultInventoryThreshold(threshold: Int) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { applyDefaultInventoryThreshold(threshold) }) return
+        val bizId = _uiState.value.activeAccount?.id ?: return
+        val safe = threshold.coerceIn(1, 100_000)
+        setStockAlertThreshold(safe)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                inventoryRepository.applyDefaultThresholdToAll(bizId, safe.toDouble())
+            }
+            showToast("Seuil d’alerte appliqué à tout l’inventaire : $safe")
+        }
+    }
+
+    fun deleteInventoryItem(itemId: Long) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { deleteInventoryItem(itemId) }) return
+        viewModelScope.launch {
+            val item = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
+            askConfirm("Supprimer « ${item.name} » de l’inventaire ?", isDestructive = true) {
+                viewModelScope.launch {
+                    withContext(Dispatchers.IO) { inventoryRepository.deleteItem(itemId) }
+                    showToast("Article supprimé : ${item.name}")
+                }
+            }
+        }
+    }
+
+    fun importCatalogToInventory() {
+        if (!requirePermission(BizzlyPermissions.STOCK) { importCatalogToInventory() }) return
+        val bizId = _uiState.value.activeAccount?.id ?: return
+        val data = _uiState.value.businessData
+        if (data.prod.isEmpty()) {
+            showToast("Aucun produit dans le catalogue à importer.")
+            return
+        }
+        viewModelScope.launch {
+            val count = withContext(Dispatchers.IO) {
+                inventoryRepository.importMissingFromCatalog(bizId, data)
+            }
+            showToast(
+                if (count > 0) "$count article${if (count > 1) "s" else ""} importé${if (count > 1) "s" else ""} depuis le catalogue."
+                else "Tous les produits du catalogue sont déjà suivis."
+            )
+        }
+    }
+
+    private fun notifyIfCrossedThreshold(before: InventoryItemEntity, after: InventoryItemEntity) {
+        if (after.isBelowThreshold && (!before.isBelowThreshold || after.quantity < before.quantity)) {
+            val qtyStr = BizzlyCalculator.formatQty(after.quantity)
+            val thStr = BizzlyCalculator.formatQty(after.minThreshold)
+            if (after.quantity <= 0.0) {
+                showToast("Rupture de stock : ${after.name} ($qtyStr ${after.unit})")
+            } else {
+                showToast("Alerte stock bas : ${after.name} ($qtyStr < seuil $thStr ${after.unit})")
+            }
+        }
+    }
 
     // --- Cash Movements (Versements, Dépenses, Bons) ---
 

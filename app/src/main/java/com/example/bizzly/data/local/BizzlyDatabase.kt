@@ -85,13 +85,15 @@ interface BizzlyDao {
     entities = [
         BusinessAccountEntity::class,
         BusinessDataEntity::class,
-        SyncStateEntity::class
+        SyncStateEntity::class,
+        InventoryItemEntity::class
     ],
     version = 2,
     exportSchema = false
 )
 abstract class BizzlyDatabase : RoomDatabase() {
     abstract fun bizzlyDao(): BizzlyDao
+    abstract fun inventoryDao(): InventoryDao
 
     companion object {
         @Volatile

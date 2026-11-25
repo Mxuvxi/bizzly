@@ -119,7 +119,11 @@ fun MoreMenuScreen(
                 .padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-
+            if (viewModel.canTab(BizzlyTab.INVENTORY)) {
+                MoreOptionButton(Icons.Default.Inventory2, "Inventaire & alertes stock", "more_inv_btn") {
+                    viewModel.selectTab(BizzlyTab.INVENTORY)
+                }
+            }
             if (viewModel.canTab(BizzlyTab.PROD)) {
                 MoreOptionButton(Icons.Default.LocalOffer, "Produits et prix", "more_prod_btn") {
                     viewModel.selectTab(BizzlyTab.PROD)

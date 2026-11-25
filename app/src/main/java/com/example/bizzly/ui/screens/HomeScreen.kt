@@ -97,6 +97,7 @@ fun HomeScreen(
         if (p.name == r.label) r.label else "${p.name} · ${r.label}"
     }
     val lowStock = BizzlyCalculator.lowStockProducts(data)
+    val lowStockInventory by viewModel.lowStockInventoryItems.collectAsStateWithLifecycle()
 
     Column(modifier = Modifier.fillMaxWidth()) {
         BizzlyHeroHeader(
@@ -224,7 +225,38 @@ fun HomeScreen(
                 )
             }
 
-
+            // Low stock inventory alert card (Room)
+            if (lowStockInventory.isNotEmpty()) {
+                val hasZero = lowStockInventory.any { it.quantity <= 0.0 }
+                val badgeColor = if (hasZero) tokens.ko else tokens.warn
+                BizzlyCard(
+                    borderColor = badgeColor,
+                    onClick = { viewModel.selectTab(BizzlyTab.INVENTORY) },
+                    modifier = Modifier.testTag("home_inventory_low_stock_card")
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(
+                            modifier = Modifier
+                                .size(11.dp)
+                                .clip(CircleShape)
+                                .background(badgeColor)
+                        )
+                        Text(
+                            text = "Alertes inventaire : ${lowStockInventory.size} article${if (lowStockInventory.size > 1) "s" else ""} sous le seuil",
+                            fontWeight = FontWeight.Bold,
+                            color = tokens.text
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = lowStockInventory.take(5).joinToString(" · ") {
+                            "${it.name} (${BizzlyCalculator.formatQty(it.quantity)}/${BizzlyCalculator.formatQty(it.minThreshold)})"
+                        } + if (lowStockInventory.size > 5) " …" else "",
+                        fontSize = 13.sp,
+                        color = tokens.muted
+                    )
+                }
+            }
 
             // Low stock alert card (Bar)
             if (lowStock.isNotEmpty()) {
