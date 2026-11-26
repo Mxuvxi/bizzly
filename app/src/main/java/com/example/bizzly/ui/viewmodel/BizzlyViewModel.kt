@@ -9,6 +9,7 @@ import com.example.bizzly.data.local.BizzlyDatabase
 import com.example.bizzly.data.local.InventoryItemEntity
 import com.example.bizzly.data.repository.BizzlyRepository
 import com.example.bizzly.data.repository.InventoryRepository
+import com.example.bizzly.data.repository.StockAlertEvent
 import com.example.bizzly.data.sync.SupabaseSyncClient
 import com.example.bizzly.data.sync.SyncException
 import com.example.bizzly.data.sync.SyncSnapshotSummary
@@ -18,6 +19,7 @@ import com.example.bizzly.model.ArchivePeriod
 import com.example.bizzly.model.BizzlyPermissions
 import com.example.bizzly.model.BizzlyRole
 import com.example.bizzly.model.BizzlyTab
+import com.example.bizzly.model.BluetoothPrinterDevice
 import com.example.bizzly.model.BrandColors
 import com.example.bizzly.model.BrandThemeProposal
 import com.example.bizzly.model.BusinessAccount
@@ -27,13 +29,19 @@ import com.example.bizzly.model.CashMovement
 import com.example.bizzly.model.ClosedPeriod
 import com.example.bizzly.model.OpenTable
 import com.example.bizzly.model.PaidInvoice
+import com.example.bizzly.model.PaymentPart
+import com.example.bizzly.model.PrinterPaperWidth
 import com.example.bizzly.model.Product
+import com.example.bizzly.model.RestockOrderLine
 import com.example.bizzly.model.SampleCatalog
 import com.example.bizzly.model.SyncCredentials
 import com.example.bizzly.model.SyncStatus
 import com.example.bizzly.security.LockoutTracker
 import com.example.bizzly.security.PinSecurity
+import com.example.bizzly.util.EscPosPrinter
 import com.example.bizzly.util.ExportUtils
+import com.example.bizzly.util.NotificationHelper
+import kotlin.math.roundToLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -50,6 +58,8 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 enum class AuthMode {
@@ -187,6 +197,14 @@ data class BizzlyUiState(
     val chartRangeDays: Int = 7,
     val paymentMode: String = "Espèces",
     val cashGivenText: String = "",
+    val mixedMode1: String = "Espèces",
+    val mixedAmount1Text: String = "",
+    val mixedMode2: String = "Mobile Money",
+    val printerAddress: String? = null,
+    val printerName: String? = null,
+    val printerWidthMm: Int = 58,
+    val pairedPrinters: List<BluetoothPrinterDevice> = emptyList(),
+    val printerBusy: Boolean = false,
 
     val pinOverlay: PinOverlayState? = null,
     val confirmDialog: ConfirmDialogState? = null,
@@ -233,7 +251,7 @@ data class BizzlyUiState(
 class BizzlyViewModel(application: Application) : AndroidViewModel(application) {
     private val db = BizzlyDatabase.getInstance(application)
     private val repository = BizzlyRepository(application, db.bizzlyDao())
-    private val inventoryRepository = InventoryRepository(application, db.inventoryDao())
+    private val inventoryRepository = InventoryRepository(db.inventoryDao())
     private val syncClient = SupabaseSyncClient(repository)
     private val lockout = LockoutTracker(application)
 
@@ -241,33 +259,26 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     val uiState: StateFlow<BizzlyUiState> = _uiState.asStateFlow()
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    val inventoryItems: StateFlow<List<InventoryItemEntity>> = uiState
+    val inventoryItems: StateFlow<List<InventoryItemEntity>> = _uiState
         .map { it.activeAccount?.id }
         .distinctUntilChanged()
         .flatMapLatest { bizId ->
             if (bizId.isNullOrBlank()) flowOf(emptyList())
             else inventoryRepository.observeItems(bizId)
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    val lowStockInventoryItems: StateFlow<List<InventoryItemEntity>> = uiState
+    val lowStockInventoryItems: StateFlow<List<InventoryItemEntity>> = _uiState
         .map { it.activeAccount?.id }
         .distinctUntilChanged()
         .flatMapLatest { bizId ->
             if (bizId.isNullOrBlank()) flowOf(emptyList())
             else inventoryRepository.observeLowStockItems(bizId)
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    private val persistMutex = Mutex()
     private val seenDocVersions = mutableMapOf<String, Long>()
     private var syncDebounceJob: Job? = null
     private var syncDirty = false
@@ -275,11 +286,16 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     private var lastActivityMs = System.currentTimeMillis()
     private var oneShotAuthorized = false
     private var supabaseAdminToken: String? = null
+    private var pendingTabRoute: String? = null
 
     init {
+        NotificationHelper.ensureChannel(application)
         val sysNight = (application.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
         val initialDark = repository.getDarkThemePreference() ?: sysNight
+        val savedPrinterAddr = repository.getPrinterAddress()
+        val savedPrinterName = repository.getPrinterName()
+        val savedPrinterWidth = repository.getPrinterWidthMm()
 
         viewModelScope.launch {
             val initialAccounts = withContext(Dispatchers.IO) { repository.getAllAccounts() }
@@ -296,7 +312,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                     accounts = initialAccounts,
                     isDarkTheme = initialDark,
                     authMode = startMode,
-                    selectedBusinessId = if (hasLast) lastBiz else null
+                    selectedBusinessId = if (hasLast) lastBiz else null,
+                    printerAddress = savedPrinterAddr,
+                    printerName = savedPrinterName,
+                    printerWidthMm = savedPrinterWidth
                 )
             }
         }
@@ -483,6 +502,14 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         seenDocVersions.clear()
 
         val role = BizzlyRole.fromKey(profile.role)
+        val initialTab = if (pendingTabRoute == NotificationHelper.TAB_INVENTORY &&
+            BizzlyPermissions.canAccessTab(role, BizzlyTab.INVENTORY)
+        ) {
+            pendingTabRoute = null
+            BizzlyTab.INVENTORY
+        } else {
+            BizzlyPermissions.defaultTab(role)
+        }
         val withLog = appendLog(syncedSrv, "Connexion (${role.label})")
         withContext(Dispatchers.IO) {
             repository.saveBusinessData(account.id, withLog)
@@ -497,7 +524,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                 activeAccount = account,
                 activeProfile = profile,
                 businessData = withLog,
-                currentTab = BizzlyPermissions.defaultTab(role),
+                currentTab = initialTab,
                 currentTable = null,
                 salesDate = BizzlyCalculator.todayIso(),
                 salesSearch = "",
@@ -757,8 +784,17 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
 
     fun importBackupFromAuth(uri: Uri) {
         viewModelScope.launch {
+            var oversized = false
             val raw = withContext(Dispatchers.IO) {
-                getApplication<Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                getApplication<Application>().contentResolver.openInputStream(uri)?.use { stream ->
+                    val txt = BizzlyRepository.readStreamBoundedUtf8(stream)
+                    if (txt == null) oversized = true
+                    txt
+                }
+            }
+            if (oversized) {
+                showToast("Fichier trop volumineux (max 10 Mo).")
+                return@launch
             }
             if (raw == null) {
                 showToast("Impossible de lire le fichier.")
@@ -832,7 +868,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun requireSensitivePin(permission: String, action: () -> Unit): Boolean {
         if (oneShotAuthorized) return true
-        val subtitle = if (permission == BizzlyPermissions.RESET || permission == BizzlyPermissions.RESTORE) {
+        val subtitle = if (permission == BizzlyPermissions.RESET ||
+            permission == BizzlyPermissions.RESTORE ||
+            permission == BizzlyPermissions.REMISE_GERANT
+        ) {
             "PIN du gérant"
         } else {
             "PIN du gérant ou de la caisse"
@@ -847,6 +886,24 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                         onAuthorized = action
                     ),
                     subtitle = subtitle
+                )
+            )
+        }
+        return false
+    }
+
+    private fun requireManagerPin(title: String, action: () -> Unit): Boolean {
+        if (oneShotAuthorized) return true
+        _uiState.update {
+            it.copy(
+                pinOverlay = PinOverlayState(
+                    mode = PinPromptMode.Authorize(
+                        permission = BizzlyPermissions.REMISE_GERANT,
+                        title = title,
+                        subtitle = "PIN du gérant requis",
+                        onAuthorized = action
+                    ),
+                    subtitle = "PIN du gérant requis"
                 )
             )
         }
@@ -961,6 +1018,18 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
 
     // --- Navigation ---
 
+    fun handleExternalTabRequest(tabRoute: String?) {
+        if (tabRoute.isNullOrBlank()) return
+        if (!_uiState.value.isLoggedIn) {
+            pendingTabRoute = tabRoute
+            return
+        }
+        if (tabRoute == NotificationHelper.TAB_INVENTORY && canTab(BizzlyTab.INVENTORY)) {
+            pendingTabRoute = null
+            selectTab(BizzlyTab.INVENTORY)
+        }
+    }
+
     fun selectTab(tab: BizzlyTab) {
         touchActivity()
         if (!canTab(tab)) {
@@ -999,7 +1068,9 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         val nextData = appendLog(transform(_uiState.value.businessData), logMessage)
         _uiState.update { it.copy(businessData = nextData) }
         viewModelScope.launch(Dispatchers.IO) {
-            repository.saveBusinessData(acc.id, nextData)
+            persistMutex.withLock {
+                repository.saveBusinessData(acc.id, nextData)
+            }
         }
         scheduleSync()
     }
@@ -1020,8 +1091,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
-            repository.saveAccount(updatedAcc)
-            repository.saveBusinessData(updatedAcc.id, nextData)
+            persistMutex.withLock {
+                repository.saveAccount(updatedAcc)
+                repository.saveBusinessData(updatedAcc.id, nextData)
+            }
         }
         scheduleSync()
     }
@@ -1160,7 +1233,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 currentTable = tableNumber,
                 paymentMode = "Espèces",
-                cashGivenText = ""
+                cashGivenText = "",
+                mixedMode1 = "Espèces",
+                mixedAmount1Text = "",
+                mixedMode2 = "Mobile Money"
             )
         }
     }
@@ -1170,17 +1246,42 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 currentTable = null,
                 paymentMode = "Espèces",
-                cashGivenText = ""
+                cashGivenText = "",
+                mixedMode1 = "Espèces",
+                mixedAmount1Text = "",
+                mixedMode2 = "Mobile Money"
             )
         }
     }
 
     fun setPaymentMode(mode: String) {
-        _uiState.update { it.copy(paymentMode = mode, cashGivenText = "") }
+        _uiState.update { it.copy(paymentMode = mode, cashGivenText = "", mixedAmount1Text = "") }
     }
 
     fun setCashGiven(text: String) {
         _uiState.update { it.copy(cashGivenText = text.filter { ch -> ch.isDigit() }) }
+    }
+
+    fun setMixedMode1(mode: String) {
+        _uiState.update { st ->
+            val nextMode2 = if (st.mixedMode2 == mode) {
+                if (mode == "Espèces") "Mobile Money" else "Espèces"
+            } else st.mixedMode2
+            st.copy(mixedMode1 = mode, mixedMode2 = nextMode2, cashGivenText = "")
+        }
+    }
+
+    fun setMixedAmount1(text: String) {
+        _uiState.update { it.copy(mixedAmount1Text = text.filter { ch -> ch.isDigit() }) }
+    }
+
+    fun setMixedMode2(mode: String) {
+        _uiState.update { st ->
+            val nextMode1 = if (st.mixedMode1 == mode) {
+                if (mode == "Espèces") "Mobile Money" else "Espèces"
+            } else st.mixedMode1
+            st.copy(mixedMode1 = nextMode1, mixedMode2 = mode, cashGivenText = "")
+        }
     }
 
     fun setTableServer(tableNumber: Int, serverId: Long) {
@@ -1208,50 +1309,152 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             val nextQty = ((nextItems[pidKey] ?: 0.0) + delta).coerceAtLeast(0.0)
             if (nextQty > 0.0) nextItems[pidKey] = nextQty else nextItems.remove(pidKey)
 
+            val nextComped = cur.comped.toMutableMap()
+            val curComp = nextComped[pidKey] ?: 0.0
+            if (curComp > nextQty) {
+                if (nextQty > 0.0) nextComped[pidKey] = nextQty else nextComped.remove(pidKey)
+            }
+
             val nextTb = data.tb.toMutableMap()
-            if (nextItems.isEmpty() && cur.sv == defaultSrv) {
+            if (nextItems.isEmpty() && cur.sv == defaultSrv && cur.paidPartial <= 0.0) {
                 nextTb.remove(key)
             } else {
-                nextTb[key] = cur.copy(it = nextItems)
+                nextTb[key] = cur.copy(it = nextItems, comped = nextComped)
             }
             data.copy(tb = nextTb)
         }
     }
 
+    fun applyTableDiscountAndComped(
+        tableNumber: Int,
+        discountType: String,
+        discountValue: Double,
+        reason: String,
+        compedMap: Map<String, Double>
+    ) {
+        val cleanReason = reason.trim()
+        val hasAnyReduction = (discountType != "none" && discountValue > 0.0) || compedMap.values.any { it > 0.0 }
+        if (hasAnyReduction && cleanReason.isEmpty()) {
+            showToast("Un motif est obligatoire pour la remise ou les offerts.")
+            return
+        }
+        if (!requireManagerPin("Autorisation Gérant (Remise / Offert)") {
+                applyTableDiscountAndComped(tableNumber, discountType, discountValue, cleanReason, compedMap)
+            }
+        ) return
+
+        val key = tableNumber.toString()
+        val tbl = _uiState.value.businessData.tb[key] ?: return
+        val cleanComped = LinkedHashMap<String, Double>()
+        for ((pidStr, cq) in compedMap) {
+            val maxQ = tbl.it[pidStr] ?: 0.0
+            if (maxQ > 0.0 && cq > 0.0) {
+                cleanComped[pidStr] = cq.coerceIn(0.0, maxQ)
+            }
+        }
+        val cleanType = if (discountType == "percent" || discountType == "amount") discountType else "none"
+        val cleanVal = when (cleanType) {
+            "percent" -> discountValue.coerceIn(0.0, 100.0)
+            "amount" -> discountValue.coerceAtLeast(0.0)
+            else -> 0.0
+        }
+        val desc = buildString {
+            append("Remise / offerts Table $tableNumber")
+            if (cleanType == "percent" && cleanVal > 0) append(" (-${BizzlyCalculator.formatQty(cleanVal)}%)")
+            else if (cleanType == "amount" && cleanVal > 0) append(" (-${BizzlyCalculator.formatFcfa(cleanVal)})")
+            val compTotal = cleanComped.values.sum()
+            if (compTotal > 0) append(" · ${BizzlyCalculator.formatQty(compTotal)} offert(s)")
+            if (cleanReason.isNotBlank()) append(" · Motif : $cleanReason")
+        }
+
+        mutateData(desc) { d ->
+            val current = d.tb[key] ?: return@mutateData d
+            val tbMut = d.tb.toMutableMap()
+            tbMut[key] = current.copy(
+                comped = cleanComped,
+                discountType = if (cleanVal > 0.0) cleanType else "none",
+                discountValue = if (cleanVal > 0.0) cleanVal else 0.0,
+                discountReason = if (hasAnyReduction) cleanReason else ""
+            )
+            d.copy(tb = tbMut)
+        }
+        showToast(if (hasAnyReduction) "Remise appliquée et tracée au journal." else "Remises retirées.")
+    }
+
     fun payTable(tableNumber: Int) {
         if (!requirePermission(BizzlyPermissions.ENCAISSER) { payTable(tableNumber) }) return
         val st = _uiState.value
+        val acc = st.activeAccount ?: return
         val data = st.businessData
         val key = tableNumber.toString()
         val tbl = data.tb[key] ?: return
-        val total = BizzlyCalculator.tableTotal(data, tableNumber)
-        if (total <= 0.0) return
+        val breakdown = BizzlyCalculator.calculateTableBreakdown(data, tbl)
+        val due = breakdown.remainingDue
+        if (due <= 0.0 && tbl.it.isEmpty()) return
 
-        val given = if (st.paymentMode == "Espèces") st.cashGivenText.toDoubleOrNull() ?: 0.0 else 0.0
-        if (given > 0.0 && given < total) {
-            showToast("Le montant donné est insuffisant.")
+        val payments: List<PaymentPart>
+        val modeLabel: String
+        val cashDue: Double
+        if (st.paymentMode == "Mixte") {
+            val amt1 = st.mixedAmount1Text.toDoubleOrNull() ?: 0.0
+            if (amt1 <= 0.0 || amt1 >= due) {
+                showToast("En mode Mixte, saisissez un premier montant entre 1 F et ${BizzlyCalculator.formatFcfa(due - 1)}.")
+                return
+            }
+            val amt2 = (due - amt1).coerceAtLeast(0.0)
+            payments = listOf(
+                PaymentPart(st.mixedMode1, amt1),
+                PaymentPart(st.mixedMode2, amt2)
+            )
+            modeLabel = "${st.mixedMode1} (${BizzlyCalculator.formatFcfa(amt1)}) + ${st.mixedMode2} (${BizzlyCalculator.formatFcfa(amt2)})"
+            cashDue = payments.filter { it.mode == "Espèces" }.sumOf { it.amount }
+        } else {
+            payments = listOf(PaymentPart(st.paymentMode, due))
+            modeLabel = st.paymentMode
+            cashDue = if (st.paymentMode == "Espèces") due else 0.0
+        }
+
+        val given = if (cashDue > 0.0) st.cashGivenText.toDoubleOrNull() ?: 0.0 else 0.0
+        if (given > 0.0 && given < cashDue) {
+            showToast("Le montant donné en espèces est insuffisant.")
             return
         }
 
         val today = BizzlyCalculator.todayIso()
         val srvName = BizzlyCalculator.serverName(data, tbl.sv)
-        val changeSuffix = if (given > 0.0) " · rendu ${BizzlyCalculator.formatFcfa(given - total)}" else ""
-        val msg = "Table $tableNumber encaissée · ${BizzlyCalculator.formatFcfa(total)} · $srvName · ${st.paymentMode}$changeSuffix"
+        val changeSuffix = if (given > 0.0 && cashDue > 0.0) " · rendu ${BizzlyCalculator.formatFcfa(given - cashDue)}" else ""
+        val discSuffix = if (breakdown.tableDiscount + breakdown.compedDiscount > 0.0) {
+            " · remise ${BizzlyCalculator.formatFcfa(breakdown.tableDiscount + breakdown.compedDiscount)}"
+        } else ""
+        val msg = "Table $tableNumber encaissée · ${BizzlyCalculator.formatFcfa(due)} · $srvName · $modeLabel$discSuffix$changeSuffix"
+
+        val physicalSoldMap = LinkedHashMap<Long, Double>()
+        tbl.it.forEach { (pidStr, q) ->
+            val pid = pidStr.toLongOrNull() ?: return@forEach
+            if (q > 0.0) physicalSoldMap[pid] = (physicalSoldMap[pid] ?: 0.0) + q
+        }
 
         mutateData(msg) { d ->
             val svMut = d.sv.mapValues { it.value.toMutableMap() }.toMutableMap()
             val todayMap = svMut.getOrPut(today) { mutableMapOf() }
             for ((pidStr, q) in tbl.it) {
-                todayMap[pidStr] = (todayMap[pidStr] ?: 0.0) + q
+                val compQ = (tbl.comped[pidStr] ?: 0.0).coerceIn(0.0, q)
+                val paidQ = (q - compQ).coerceAtLeast(0.0)
+                if (paidQ > 0.0) {
+                    todayMap[pidStr] = (todayMap[pidStr] ?: 0.0) + paidQ
+                }
             }
             val paidRec = PaidInvoice(
                 d = today,
                 t = tableNumber,
                 sv = tbl.sv,
-                tot = total,
-                m = st.paymentMode,
+                tot = due,
+                m = modeLabel,
                 u = syncClient.newUid(),
-                ts = System.currentTimeMillis()
+                ts = System.currentTimeMillis(),
+                payments = payments,
+                discountAmount = breakdown.tableDiscount + breakdown.compedDiscount,
+                discountReason = tbl.discountReason
             )
             val tbMut = d.tb.toMutableMap().apply { remove(key) }
             d.copy(
@@ -1260,8 +1463,253 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                 tb = tbMut
             )
         }
-        _uiState.update { it.copy(currentTable = null, cashGivenText = "", paymentMode = "Espèces") }
+        _uiState.update {
+            it.copy(
+                currentTable = null,
+                cashGivenText = "",
+                paymentMode = "Espèces",
+                mixedAmount1Text = ""
+            )
+        }
         showToast("Table $tableNumber encaissée")
+
+        viewModelScope.launch {
+            val alerts = withContext(Dispatchers.IO) {
+                inventoryRepository.deductForSoldQuantities(acc.id, data.prod, physicalSoldMap)
+            }
+            handleStockAlertEvents(alerts)
+        }
+    }
+
+    fun payTableEqualSplit(
+        tableNumber: Int,
+        totalParts: Int,
+        payments: List<PaymentPart>,
+        cashGiven: Double
+    ) {
+        if (!requirePermission(BizzlyPermissions.ENCAISSER) {
+                payTableEqualSplit(tableNumber, totalParts, payments, cashGiven)
+            }
+        ) return
+        val st = _uiState.value
+        val acc = st.activeAccount ?: return
+        val data = st.businessData
+        val key = tableNumber.toString()
+        val tbl = data.tb[key] ?: return
+        val breakdown = BizzlyCalculator.calculateTableBreakdown(data, tbl)
+        val remaining = breakdown.remainingDue
+        if (remaining <= 0.0) return
+
+        val safeTotalParts = totalParts.coerceIn(2, 20)
+        val nextPartIdx = tbl.paidCount + 1
+        val remainingParts = (safeTotalParts - tbl.paidCount).coerceAtLeast(1)
+        val partAmount = if (remainingParts <= 1) {
+            remaining
+        } else {
+            (remaining / remainingParts).roundToLong().toDouble().coerceIn(1.0, remaining)
+        }
+        val isFinalPart = remainingParts <= 1 || (remaining - partAmount) < 1.0
+        val collected = if (isFinalPart) remaining else partAmount
+
+        val cashPart = payments.filter { it.mode == "Espèces" }.sumOf { it.amount }
+        if (cashGiven > 0.0 && cashGiven < cashPart) {
+            showToast("Le montant donné en espèces est insuffisant.")
+            return
+        }
+
+        val today = BizzlyCalculator.todayIso()
+        val modeLabel = if (payments.size > 1) {
+            payments.joinToString(" + ") { "${it.mode} (${BizzlyCalculator.formatFcfa(it.amount)})" }
+        } else {
+            payments.firstOrNull()?.mode ?: "Espèces"
+        }
+
+        if (isFinalPart) {
+            val physicalSoldMap = LinkedHashMap<Long, Double>()
+            tbl.it.forEach { (pidStr, q) ->
+                val pid = pidStr.toLongOrNull() ?: return@forEach
+                if (q > 0.0) physicalSoldMap[pid] = (physicalSoldMap[pid] ?: 0.0) + q
+            }
+            val msg = "Table $tableNumber soldée (part $nextPartIdx/$safeTotalParts) · ${BizzlyCalculator.formatFcfa(collected)} · $modeLabel"
+            mutateData(msg) { d ->
+                val svMut = d.sv.mapValues { it.value.toMutableMap() }.toMutableMap()
+                val todayMap = svMut.getOrPut(today) { mutableMapOf() }
+                for ((pidStr, q) in tbl.it) {
+                    val compQ = (tbl.comped[pidStr] ?: 0.0).coerceIn(0.0, q)
+                    val paidQ = (q - compQ).coerceAtLeast(0.0)
+                    if (paidQ > 0.0) {
+                        todayMap[pidStr] = (todayMap[pidStr] ?: 0.0) + paidQ
+                    }
+                }
+                val paidRec = PaidInvoice(
+                    d = today,
+                    t = tableNumber,
+                    sv = tbl.sv,
+                    tot = collected,
+                    m = modeLabel,
+                    u = syncClient.newUid(),
+                    ts = System.currentTimeMillis(),
+                    payments = payments,
+                    discountAmount = breakdown.tableDiscount + breakdown.compedDiscount,
+                    discountReason = tbl.discountReason
+                )
+                val tbMut = d.tb.toMutableMap().apply { remove(key) }
+                d.copy(sv = svMut, paid = listOf(paidRec) + d.paid, tb = tbMut)
+            }
+            _uiState.update { it.copy(currentTable = null, cashGivenText = "", paymentMode = "Espèces", mixedAmount1Text = "") }
+            showToast("Table $tableNumber entièrement réglée !")
+            viewModelScope.launch {
+                val alerts = withContext(Dispatchers.IO) {
+                    inventoryRepository.deductForSoldQuantities(acc.id, data.prod, physicalSoldMap)
+                }
+                handleStockAlertEvents(alerts)
+            }
+        } else {
+            val msg = "Part $nextPartIdx/$safeTotalParts Table $tableNumber · ${BizzlyCalculator.formatFcfa(collected)} · $modeLabel"
+            mutateData(msg) { d ->
+                val cur = d.tb[key] ?: return@mutateData d
+                val paidRec = PaidInvoice(
+                    d = today,
+                    t = tableNumber,
+                    sv = cur.sv,
+                    tot = collected,
+                    m = modeLabel,
+                    u = syncClient.newUid(),
+                    ts = System.currentTimeMillis(),
+                    payments = payments
+                )
+                val tbMut = d.tb.toMutableMap()
+                tbMut[key] = cur.copy(
+                    paidPartial = cur.paidPartial + collected,
+                    paidCount = nextPartIdx,
+                    splitTotalParts = safeTotalParts
+                )
+                d.copy(paid = listOf(paidRec) + d.paid, tb = tbMut)
+            }
+            showToast("Part $nextPartIdx/$safeTotalParts encaissée (${BizzlyCalculator.formatFcfa(collected)})")
+        }
+    }
+
+    fun payTableByItems(
+        tableNumber: Int,
+        selectedItems: Map<String, Double>,
+        payments: List<PaymentPart>,
+        cashGiven: Double
+    ) {
+        if (!requirePermission(BizzlyPermissions.ENCAISSER) {
+                payTableByItems(tableNumber, selectedItems, payments, cashGiven)
+            }
+        ) return
+        val st = _uiState.value
+        val acc = st.activeAccount ?: return
+        val data = st.businessData
+        val key = tableNumber.toString()
+        val tbl = data.tb[key] ?: return
+        val fullBreakdown = BizzlyCalculator.calculateTableBreakdown(data, tbl)
+
+        var selectedRaw = 0.0
+        val physicalSoldMap = LinkedHashMap<Long, Double>()
+        for ((pidStr, reqQ) in selectedItems) {
+            val availQ = tbl.it[pidStr] ?: 0.0
+            val takeQ = reqQ.coerceIn(0.0, availQ)
+            if (takeQ <= 0.0) continue
+            val p = BizzlyCalculator.productByIdStr(data, pidStr) ?: continue
+            val compAvail = (tbl.comped[pidStr] ?: 0.0).coerceIn(0.0, availQ)
+            val paidShare = ((availQ - compAvail) / availQ.coerceAtLeast(1.0)).coerceIn(0.0, 1.0)
+            selectedRaw += takeQ * paidShare * p.pv
+            val pid = pidStr.toLongOrNull()
+            if (pid != null) physicalSoldMap[pid] = (physicalSoldMap[pid] ?: 0.0) + takeQ
+        }
+        if (physicalSoldMap.isEmpty()) return
+
+        val remainingItemsTotalQty = tbl.it.entries.sumOf { (pidStr, q) ->
+            (q - (selectedItems[pidStr] ?: 0.0)).coerceAtLeast(0.0)
+        }
+        val closesTable = remainingItemsTotalQty <= 0.0001
+        val collected = if (closesTable) {
+            fullBreakdown.remainingDue
+        } else {
+            val ratio = if (fullBreakdown.afterComped > 0.0) {
+                (selectedRaw / fullBreakdown.afterComped).coerceIn(0.0, 1.0)
+            } else 1.0
+            (fullBreakdown.remainingDue * ratio).roundToLong().toDouble().coerceAtMost(fullBreakdown.remainingDue)
+        }
+
+        val cashPart = payments.filter { it.mode == "Espèces" }.sumOf { it.amount }
+        if (cashGiven > 0.0 && cashGiven < cashPart) {
+            showToast("Le montant donné en espèces est insuffisant.")
+            return
+        }
+
+        val today = BizzlyCalculator.todayIso()
+        val modeLabel = if (payments.size > 1) {
+            payments.joinToString(" + ") { "${it.mode} (${BizzlyCalculator.formatFcfa(it.amount)})" }
+        } else {
+            payments.firstOrNull()?.mode ?: "Espèces"
+        }
+        val msg = "Encaissement partiel Table $tableNumber · ${BizzlyCalculator.formatFcfa(collected)} · $modeLabel"
+
+        mutateData(msg) { d ->
+            val cur = d.tb[key] ?: return@mutateData d
+            val svMut = d.sv.mapValues { it.value.toMutableMap() }.toMutableMap()
+            val todayMap = svMut.getOrPut(today) { mutableMapOf() }
+            val nextItems = cur.it.toMutableMap()
+            val nextComped = cur.comped.toMutableMap()
+
+            for ((pidStr, reqQ) in selectedItems) {
+                val avail = nextItems[pidStr] ?: continue
+                val take = reqQ.coerceIn(0.0, avail)
+                if (take <= 0.0) continue
+                val compAvail = (nextComped[pidStr] ?: 0.0).coerceIn(0.0, avail)
+                val compUsed = (compAvail * (take / avail)).coerceAtMost(take)
+                val paidQ = (take - compUsed).coerceAtLeast(0.0)
+                if (paidQ > 0.0) {
+                    todayMap[pidStr] = (todayMap[pidStr] ?: 0.0) + paidQ
+                }
+                val left = (avail - take).coerceAtLeast(0.0)
+                if (left > 0.0) nextItems[pidStr] = left else nextItems.remove(pidStr)
+                val leftComp = (compAvail - compUsed).coerceIn(0.0, left)
+                if (leftComp > 0.0) nextComped[pidStr] = leftComp else nextComped.remove(pidStr)
+            }
+
+            val paidRec = PaidInvoice(
+                d = today,
+                t = tableNumber,
+                sv = cur.sv,
+                tot = collected,
+                m = modeLabel,
+                u = syncClient.newUid(),
+                ts = System.currentTimeMillis(),
+                payments = payments,
+                discountAmount = if (closesTable) fullBreakdown.tableDiscount + fullBreakdown.compedDiscount else 0.0,
+                discountReason = if (closesTable) cur.discountReason else ""
+            )
+            val tbMut = d.tb.toMutableMap()
+            if (nextItems.isEmpty()) {
+                tbMut.remove(key)
+            } else {
+                tbMut[key] = cur.copy(
+                    it = nextItems,
+                    comped = nextComped,
+                    paidCount = cur.paidCount + 1
+                )
+            }
+            d.copy(sv = svMut, paid = listOf(paidRec) + d.paid, tb = tbMut)
+        }
+
+        if (closesTable) {
+            _uiState.update { it.copy(currentTable = null, cashGivenText = "", paymentMode = "Espèces", mixedAmount1Text = "") }
+            showToast("Table $tableNumber entièrement soldée !")
+        } else {
+            showToast("Articles encaissés (${BizzlyCalculator.formatFcfa(collected)})")
+        }
+
+        viewModelScope.launch {
+            val alerts = withContext(Dispatchers.IO) {
+                inventoryRepository.deductForSoldQuantities(acc.id, data.prod, physicalSoldMap)
+            }
+            handleStockAlertEvents(alerts)
+        }
     }
 
     fun freeTable(tableNumber: Int) {
@@ -1271,7 +1719,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                 val tbMut = data.tb.toMutableMap().apply { remove(tableNumber.toString()) }
                 data.copy(tb = tbMut)
             }
-            _uiState.update { it.copy(currentTable = null, cashGivenText = "", paymentMode = "Espèces") }
+            _uiState.update { it.copy(currentTable = null, cashGivenText = "", paymentMode = "Espèces", mixedAmount1Text = "") }
         }
     }
 
@@ -1279,17 +1727,34 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
 
     fun adjustDailySale(productId: Long, delta: Double) {
         if (!requirePermission(BizzlyPermissions.VENTES) { adjustDailySale(productId, delta) }) return
+        val acc = _uiState.value.activeAccount ?: return
         val date = _uiState.value.salesDate
-        val prod = BizzlyCalculator.productById(_uiState.value.businessData, productId) ?: return
-        val msg = "${if (delta > 0) "Vente +1 " else "Vente −1 "}${prod.n} · ${BizzlyCalculator.formatFcfa(prod.pv)}"
+        val dataSnapshot = _uiState.value.businessData
+        val prod = BizzlyCalculator.productById(dataSnapshot, productId) ?: return
+        val pidKey = productId.toString()
+        val prevQty = dataSnapshot.sv[date]?.get(pidKey) ?: 0.0
+        val nextQty = (prevQty + delta).coerceAtLeast(0.0)
+        val appliedDelta = nextQty - prevQty
+        if (appliedDelta == 0.0) return
+
+        val msg = "${if (appliedDelta > 0) "Vente +1 " else "Vente −1 "}${prod.n} · ${BizzlyCalculator.formatFcfa(prod.pv)}"
         mutateData(msg) { data ->
             val svMut = data.sv.mapValues { it.value.toMutableMap() }.toMutableMap()
             val dayMap = svMut.getOrPut(date) { mutableMapOf() }
-            val pidKey = productId.toString()
-            val nextQty = ((dayMap[pidKey] ?: 0.0) + delta).coerceAtLeast(0.0)
             if (nextQty > 0.0) dayMap[pidKey] = nextQty else dayMap.remove(pidKey)
             if (dayMap.isEmpty()) svMut.remove(date)
             data.copy(sv = svMut)
+        }
+
+        viewModelScope.launch {
+            val alerts = withContext(Dispatchers.IO) {
+                inventoryRepository.deductForSoldQuantities(
+                    businessId = acc.id,
+                    products = dataSnapshot.prod,
+                    soldDeltaByProductId = mapOf(productId to appliedDelta)
+                )
+            }
+            handleStockAlertEvents(alerts)
         }
     }
 
@@ -1365,156 +1830,266 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         showToast("Liste d’exemple chargée")
     }
 
-    // --- Room Inventory Items & Threshold Alerts ---
+    // --- Room Inventory & Stock Threshold Alerts ---
 
     fun saveInventoryItem(
-        editingId: Long?,
-        nameRaw: String,
-        skuRaw: String,
-        categoryRaw: String,
-        unitRaw: String,
-        quantityRaw: String,
-        minThresholdRaw: String,
-        unitPriceRaw: String,
-        notesRaw: String
+        id: Long?,
+        name: String,
+        sku: String,
+        category: String,
+        unit: String,
+        quantity: Double,
+        minThreshold: Double,
+        unitPrice: Double,
+        notes: String
     ) {
         if (!requirePermission(BizzlyPermissions.STOCK) {
-                saveInventoryItem(
-                    editingId, nameRaw, skuRaw, categoryRaw, unitRaw,
-                    quantityRaw, minThresholdRaw, unitPriceRaw, notesRaw
-                )
+                saveInventoryItem(id, name, sku, category, unit, quantity, minThreshold, unitPrice, notes)
             }
         ) return
-        val bizId = _uiState.value.activeAccount?.id ?: return
-        val name = nameRaw.trim().uppercase()
-        if (name.isEmpty()) {
-            showToast("Indiquez un nom d’article.")
+        val acc = _uiState.value.activeAccount ?: return
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) {
+            showToast("Le nom de l’article est obligatoire.")
             return
         }
-        val qty = BizzlyCalculator.clampNumber(quantityRaw.replace(',', '.').toDoubleOrNull() ?: 0.0)
-        val threshold = BizzlyCalculator.clampNumber(
-            minThresholdRaw.replace(',', '.').toDoubleOrNull()
-                ?: _uiState.value.businessData.seuil.toDouble()
-        )
-        val unitPrice = BizzlyCalculator.clampNumber(unitPriceRaw.replace(',', '.').toDoubleOrNull() ?: 0.0)
+        val cleanQty = quantity.coerceAtLeast(0.0)
+        val cleanMin = minThreshold.coerceAtLeast(0.0)
+        val cleanPrice = unitPrice.coerceAtLeast(0.0)
+        val cleanUnit = unit.trim().ifEmpty { "unité" }
 
         viewModelScope.launch {
-            val existing = if (editingId != null) {
-                withContext(Dispatchers.IO) { inventoryRepository.getItemById(editingId) }
-            } else null
-
-            val entity = InventoryItemEntity(
-                id = editingId ?: 0L,
-                businessId = bizId,
-                productId = existing?.productId,
-                name = name,
-                sku = skuRaw.trim(),
-                category = categoryRaw.trim().ifEmpty { "Général" },
-                unit = unitRaw.trim().ifEmpty { "unités" },
-                quantity = qty,
-                minThreshold = threshold,
-                unitPrice = unitPrice,
-                notes = notesRaw.trim()
-            )
-            withContext(Dispatchers.IO) { inventoryRepository.saveItem(entity) }
-            if (entity.isBelowThreshold) {
-                val msg = if (qty <= 0.0) {
-                    "Rupture de stock : $name (${BizzlyCalculator.formatQty(qty)} ${entity.unit})"
-                } else {
-                    "Alerte stock bas : $name (${BizzlyCalculator.formatQty(qty)} < seuil ${BizzlyCalculator.formatQty(threshold)})"
-                }
-                showToast(msg)
-            } else {
-                showToast(if (editingId == null) "Article ajouté : $name" else "Article mis à jour : $name")
+            val saved = withContext(Dispatchers.IO) {
+                val existing = id?.let { inventoryItems.value.firstOrNull { row -> row.id == it } }
+                val entity = InventoryItemEntity(
+                    id = id ?: 0L,
+                    businessId = acc.id,
+                    productId = existing?.productId,
+                    name = cleanName,
+                    sku = sku.trim(),
+                    category = category.trim(),
+                    unit = cleanUnit,
+                    quantity = cleanQty,
+                    minThreshold = cleanMin,
+                    unitPrice = cleanPrice,
+                    notes = notes.trim()
+                )
+                inventoryRepository.upsertItem(entity)
+                entity
+            }
+            if (!notifyIfCrossedThreshold(saved, wasLowBefore = false)) {
+                showToast(if (id == null) "Article ajouté à l’inventaire." else "Article mis à jour.")
             }
         }
     }
 
-    fun adjustInventoryQuantity(itemId: Long, delta: Double) {
-        if (!requirePermission(BizzlyPermissions.STOCK) { adjustInventoryQuantity(itemId, delta) }) return
+    fun adjustInventoryQuantity(item: InventoryItemEntity, delta: Double) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { adjustInventoryQuantity(item, delta) }) return
+        val wasLow = item.isBelowThreshold
         viewModelScope.launch {
-            val before = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
-            val updated = withContext(Dispatchers.IO) { inventoryRepository.adjustQuantity(itemId, delta) } ?: return@launch
-            notifyIfCrossedThreshold(before, updated)
-        }
-    }
-
-    fun setInventoryQuantityAndThreshold(itemId: Long, quantityRaw: String, thresholdRaw: String) {
-        if (!requirePermission(BizzlyPermissions.STOCK) { setInventoryQuantityAndThreshold(itemId, quantityRaw, thresholdRaw) }) return
-        val qty = quantityRaw.replace(',', '.').toDoubleOrNull()
-        val threshold = thresholdRaw.replace(',', '.').toDoubleOrNull()
-        if (qty == null || threshold == null) {
-            showToast("Valeurs numériques invalides.")
-            return
-        }
-        viewModelScope.launch {
-            val before = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
-            withContext(Dispatchers.IO) {
-                inventoryRepository.updateThreshold(itemId, threshold)
-            }
             val updated = withContext(Dispatchers.IO) {
-                inventoryRepository.setQuantity(itemId, qty)
+                inventoryRepository.adjustQuantity(item.id, delta)
             } ?: return@launch
-            notifyIfCrossedThreshold(before, updated)
+            notifyIfCrossedThreshold(updated, wasLowBefore = wasLow)
         }
     }
 
-    fun applyDefaultInventoryThreshold(threshold: Int) {
-        if (!requirePermission(BizzlyPermissions.STOCK) { applyDefaultInventoryThreshold(threshold) }) return
-        val bizId = _uiState.value.activeAccount?.id ?: return
-        val safe = threshold.coerceIn(1, 100_000)
-        setStockAlertThreshold(safe)
+    fun setInventoryQuantity(item: InventoryItemEntity, quantity: Double) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { setInventoryQuantity(item, quantity) }) return
+        val wasLow = item.isBelowThreshold
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                inventoryRepository.applyDefaultThresholdToAll(bizId, safe.toDouble())
+            val updated = withContext(Dispatchers.IO) {
+                inventoryRepository.setQuantity(item.id, quantity)
+            } ?: return@launch
+            if (!notifyIfCrossedThreshold(updated, wasLowBefore = wasLow)) {
+                showToast("${updated.name} : ${BizzlyCalculator.formatQty(updated.quantity)} ${updated.unit}")
             }
-            showToast("Seuil d’alerte appliqué à tout l’inventaire : $safe")
         }
     }
 
-    fun deleteInventoryItem(itemId: Long) {
-        if (!requirePermission(BizzlyPermissions.STOCK) { deleteInventoryItem(itemId) }) return
-        viewModelScope.launch {
-            val item = withContext(Dispatchers.IO) { inventoryRepository.getItemById(itemId) } ?: return@launch
-            askConfirm("Supprimer « ${item.name} » de l’inventaire ?", isDestructive = true) {
-                viewModelScope.launch {
-                    withContext(Dispatchers.IO) { inventoryRepository.deleteItem(itemId) }
-                    showToast("Article supprimé : ${item.name}")
+    fun deleteInventoryItem(item: InventoryItemEntity) {
+        if (!requirePermission(BizzlyPermissions.STOCK) { deleteInventoryItem(item) }) return
+        askConfirm("Supprimer « ${item.name} » de l’inventaire ?", isDestructive = true) {
+            viewModelScope.launch {
+                withContext(Dispatchers.IO) {
+                    inventoryRepository.deleteItem(item.id)
                 }
+                showToast("Article supprimé.")
             }
         }
     }
 
-    fun importCatalogToInventory() {
-        if (!requirePermission(BizzlyPermissions.STOCK) { importCatalogToInventory() }) return
-        val bizId = _uiState.value.activeAccount?.id ?: return
+    fun syncInventoryFromCatalog() {
+        if (!requirePermission(BizzlyPermissions.STOCK) { syncInventoryFromCatalog() }) return
+        val acc = _uiState.value.activeAccount ?: return
+        val data = _uiState.value.businessData
+        viewModelScope.launch {
+            val added = withContext(Dispatchers.IO) {
+                inventoryRepository.syncMissingFromCatalog(acc.id, data)
+            }
+            if (added > 0) {
+                showToast("$added article(s) importé(s) depuis le catalogue.")
+            } else {
+                showToast("Tous les produits du catalogue sont déjà dans l’inventaire.")
+            }
+        }
+    }
+
+    private fun shouldNotifyCurrentRole(): Boolean {
+        val role = currentRole()
+        return role == BizzlyRole.GERANT || role == BizzlyRole.CAISSE
+    }
+
+    private fun handleStockAlertEvents(events: List<StockAlertEvent>) {
+        if (events.isEmpty()) return
+        val acc = _uiState.value.activeAccount ?: return
+        val items = events.map { it.item }
+        if (shouldNotifyCurrentRole()) {
+            NotificationHelper.notifyStockAlerts(getApplication(), acc.name, items)
+        }
+        val first = items.first()
+        val msg = when {
+            items.size == 1 && first.quantity <= 0.0 -> "Rupture de stock : ${first.name}"
+            items.size == 1 -> "Alerte stock bas : ${first.name} (${BizzlyCalculator.formatQty(first.quantity)} / seuil ${BizzlyCalculator.formatQty(first.minThreshold)})"
+            else -> "${items.size} alertes de stock déclenchées (${items.take(2).joinToString(", ") { it.name }}…)"
+        }
+        showToast(msg)
+    }
+
+    private fun notifyIfCrossedThreshold(item: InventoryItemEntity, wasLowBefore: Boolean): Boolean {
+        val acc = _uiState.value.activeAccount
+        return when {
+            item.quantity <= 0.0 -> {
+                if (acc != null && shouldNotifyCurrentRole()) {
+                    NotificationHelper.notifyStockAlerts(getApplication(), acc.name, listOf(item))
+                }
+                showToast("Rupture de stock : ${item.name}")
+                true
+            }
+            item.isBelowThreshold && !wasLowBefore -> {
+                if (acc != null && shouldNotifyCurrentRole()) {
+                    NotificationHelper.notifyStockAlerts(getApplication(), acc.name, listOf(item))
+                }
+                showToast(
+                    "Alerte stock bas : ${item.name} (${BizzlyCalculator.formatQty(item.quantity)} / seuil ${BizzlyCalculator.formatQty(item.minThreshold)})"
+                )
+                true
+            }
+            else -> false
+        }
+    }
+
+    fun syncBarToInventory() {
+        if (!requirePermission(BizzlyPermissions.STOCK) { syncBarToInventory() }) return
+        val acc = _uiState.value.activeAccount ?: return
         val data = _uiState.value.businessData
         if (data.prod.isEmpty()) {
-            showToast("Aucun produit dans le catalogue à importer.")
+            showToast("Aucun produit dans le catalogue.")
             return
         }
-        viewModelScope.launch {
-            val count = withContext(Dispatchers.IO) {
-                inventoryRepository.importMissingFromCatalog(bizId, data)
+        askConfirm(
+            "Mettre à jour l’inventaire avec les quantités actuelles du Comptage Bar (${data.prod.size} produits) ?"
+        ) {
+            viewModelScope.launch {
+                val (count, alerts) = withContext(Dispatchers.IO) {
+                    inventoryRepository.syncFromBarCounts(acc.id, data)
+                }
+                mutateData("Synchro Comptage Bar → Inventaire ($count articles)") { it }
+                if (alerts.isNotEmpty()) {
+                    handleStockAlertEvents(alerts)
+                } else {
+                    showToast("$count article(s) synchronisé(s) vers l’inventaire.")
+                }
             }
-            showToast(
-                if (count > 0) "$count article${if (count > 1) "s" else ""} importé${if (count > 1) "s" else ""} depuis le catalogue."
-                else "Tous les produits du catalogue sont déjà suivis."
-            )
         }
     }
 
-    private fun notifyIfCrossedThreshold(before: InventoryItemEntity, after: InventoryItemEntity) {
-        if (after.isBelowThreshold && (!before.isBelowThreshold || after.quantity < before.quantity)) {
-            val qtyStr = BizzlyCalculator.formatQty(after.quantity)
-            val thStr = BizzlyCalculator.formatQty(after.minThreshold)
-            if (after.quantity <= 0.0) {
-                showToast("Rupture de stock : ${after.name} ($qtyStr ${after.unit})")
-            } else {
-                showToast("Alerte stock bas : ${after.name} ($qtyStr < seuil $thStr ${after.unit})")
+    fun syncInventoryToBar() {
+        if (!requirePermission(BizzlyPermissions.STOCK) { syncInventoryToBar() }) return
+        val acc = _uiState.value.activeAccount ?: return
+        val data = _uiState.value.businessData
+        if (data.prod.isEmpty()) {
+            showToast("Aucun produit dans le catalogue.")
+            return
+        }
+        askConfirm(
+            "Copier les quantités actuelles de l’Inventaire dans la colonne « Fin » du Comptage Bar ?"
+        ) {
+            viewModelScope.launch {
+                val counts = withContext(Dispatchers.IO) {
+                    inventoryRepository.getBarCountsFromInventory(acc.id, data)
+                }
+                if (counts.isEmpty()) {
+                    showToast("Aucun produit correspondant trouvé dans l’inventaire.")
+                    return@launch
+                }
+                mutateData("Synchro Inventaire → Comptage Bar (${counts.size} articles)") { d ->
+                    val nextProds = d.prod.map { p ->
+                        val qty = counts[p.id]
+                        if (qty != null) p.copy(f = qty) else p
+                    }
+                    d.copy(prod = nextProds)
+                }
+                showToast("${counts.size} produit(s) mis à jour dans le Comptage Bar.")
             }
         }
     }
+
+    fun exportRestockOrderPdf(supplierName: String, lines: List<RestockOrderLine>) {
+        if (!requirePermission(BizzlyPermissions.EXPORT) { exportRestockOrderPdf(supplierName, lines) }) return
+        if (lines.isEmpty()) {
+            showToast("Aucun article à commander.")
+            return
+        }
+        val acc = _uiState.value.activeAccount
+        _uiState.update { it.copy(exportBusy = true) }
+        viewModelScope.launch {
+            runCatching {
+                val bytes = withContext(Dispatchers.IO) {
+                    ExportUtils.generateRestockOrderPdf(acc, supplierName, lines)
+                }
+                val filename = "${BizzlyCalculator.slugify(acc?.name)}-bon-commande-${BizzlyCalculator.todayIso()}.pdf"
+                publishExport(
+                    filename = filename,
+                    bytes = bytes,
+                    mimeType = "application/pdf",
+                    chooserTitle = "Bon de commande fournisseur PDF"
+                )
+            }.onFailure {
+                _uiState.update { s -> s.copy(exportBusy = false) }
+                showToast("Impossible de générer le bon de commande PDF.")
+            }
+        }
+    }
+
+    fun exportRestockOrderExcel(supplierName: String, lines: List<RestockOrderLine>) {
+        if (!requirePermission(BizzlyPermissions.EXPORT) { exportRestockOrderExcel(supplierName, lines) }) return
+        if (lines.isEmpty()) {
+            showToast("Aucun article à commander.")
+            return
+        }
+        val acc = _uiState.value.activeAccount
+        _uiState.update { it.copy(exportBusy = true) }
+        viewModelScope.launch {
+            runCatching {
+                val bytes = withContext(Dispatchers.IO) {
+                    ExportUtils.generateRestockOrderExcel(acc, supplierName, lines)
+                }
+                val filename = "${BizzlyCalculator.slugify(acc?.name)}-bon-commande-${BizzlyCalculator.todayIso()}.xlsx"
+                publishExport(
+                    filename = filename,
+                    bytes = bytes,
+                    mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    chooserTitle = "Bon de commande fournisseur Excel"
+                )
+            }.onFailure {
+                _uiState.update { s -> s.copy(exportBusy = false) }
+                showToast("Impossible de générer le bon de commande Excel.")
+            }
+        }
+    }
+
+
 
     // --- Cash Movements (Versements, Dépenses, Bons) ---
 
@@ -1630,6 +2205,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     // --- Enterprise, Profiles, Brand, Tables ---
 
     fun updateBusinessField(field: String, rawValue: String) {
+        if (!requirePermission(BizzlyPermissions.RESET) { updateBusinessField(field, rawValue) }) return
         val value = rawValue.trim()
         if (field == "name" && value.length < 2) {
             showToast("Le nom est obligatoire.")
@@ -1647,6 +2223,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun pickAccountLogo(uri: Uri) {
+        if (!requirePermission(BizzlyPermissions.RESET) { pickAccountLogo(uri) }) return
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 ExportUtils.decodeAndResizeLogo(getApplication(), uri)
@@ -1671,11 +2248,13 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun removeAccountLogo() {
+        if (!requirePermission(BizzlyPermissions.RESET) { removeAccountLogo() }) return
         _uiState.update { it.copy(enterpriseLogoProposals = emptyList()) }
         mutateAccount { acc -> acc.copy(logo = "", lw = 0, lh = 0) }
     }
 
     fun updateBrandColor(channel: String, hex: String) {
+        if (!requirePermission(BizzlyPermissions.RESET) { updateBrandColor(channel, hex) }) return
         if (!Regex("^#[0-9a-fA-F]{6}$").matches(hex)) return
         mutateAccount { acc ->
             val b = acc.brand
@@ -1689,6 +2268,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun applyEnterpriseBrand(brand: BrandColors) {
+        if (!requirePermission(BizzlyPermissions.RESET) { applyEnterpriseBrand(brand) }) return
         mutateAccount("Thème de couleurs modifié") { it.copy(brand = brand) }
         showToast("Thème appliqué à toute l’application.")
     }
@@ -1711,6 +2291,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun autoPaletteFromLogo() {
+        if (!requirePermission(BizzlyPermissions.RESET) { autoPaletteFromLogo() }) return
         val acc = _uiState.value.activeAccount
         if (acc?.logo.isNullOrBlank()) {
             showToast("Ajoutez d’abord un logo.")
@@ -1735,10 +2316,12 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun resetBrandToBizzly() {
+        if (!requirePermission(BizzlyPermissions.RESET) { resetBrandToBizzly() }) return
         mutateAccount { it.copy(brand = BrandColors()) }
     }
 
     fun updateTableCount(countRaw: String) {
+        if (!requirePermission(BizzlyPermissions.RESET) { updateTableCount(countRaw) }) return
         val data = _uiState.value.businessData
         var maxOpen = 0
         for ((k, tbl) in data.tb) {
@@ -1749,6 +2332,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun renameProfile(profileId: Long, newName: String) {
+        if (!requirePermission(BizzlyPermissions.RESET) { renameProfile(profileId, newName) }) return
         val trimmed = newName.trim()
         if (trimmed.isEmpty()) return
         mutateAccount { acc ->
@@ -1757,15 +2341,17 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun changeProfileRole(profileId: Long, newRole: String) {
+        if (!requireSensitivePin(BizzlyPermissions.RESET) { changeProfileRole(profileId, newRole) }) return
+        val validRole = BizzlyRole.entries.firstOrNull { it.key == newRole }?.key ?: return
         val acc = _uiState.value.activeAccount ?: return
         val prof = acc.profiles.firstOrNull { it.id == profileId } ?: return
         val otherGerants = acc.profiles.count { it.role == BizzlyRole.GERANT.key && it.id != profileId }
-        if (prof.role == BizzlyRole.GERANT.key && newRole != BizzlyRole.GERANT.key && otherGerants == 0) {
+        if (prof.role == BizzlyRole.GERANT.key && validRole != BizzlyRole.GERANT.key && otherGerants == 0) {
             showToast("Il faut garder au moins un gérant.")
             return
         }
         mutateAccount { a ->
-            a.copy(profiles = a.profiles.map { if (it.id == profileId) it.copy(role = newRole) else it })
+            a.copy(profiles = a.profiles.map { if (it.id == profileId) it.copy(role = validRole) else it })
         }
     }
 
@@ -1816,11 +2402,13 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun addProfile(nameRaw: String, roleKey: String) {
+        if (!requireSensitivePin(BizzlyPermissions.RESET) { addProfile(nameRaw, roleKey) }) return
         val name = nameRaw.trim()
         if (name.isEmpty()) return
+        val validRole = BizzlyRole.entries.firstOrNull { it.key == roleKey }?.key ?: BizzlyRole.SERVEUR.key
         val newId = System.currentTimeMillis()
         mutateAccount("Profil ajouté : $name") { a ->
-            a.copy(profiles = a.profiles + BusinessProfile(id = newId, role = roleKey, name = name))
+            a.copy(profiles = a.profiles + BusinessProfile(id = newId, role = validRole, name = name))
         }
     }
 
@@ -1853,7 +2441,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             isDestructive = true
         ) {
             viewModelScope.launch {
-                withContext(Dispatchers.IO) { repository.deleteBusiness(acc.id) }
+                withContext(Dispatchers.IO) {
+                    repository.deleteBusiness(acc.id)
+                    inventoryRepository.deleteAllForBusiness(acc.id)
+                }
                 switchBusiness()
                 showToast("Entreprise retirée de cet appareil.")
             }
@@ -1869,7 +2460,12 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             val fresh = BizzlyCalculator.syncServersWithAccount(acc, repository.freshBusinessData())
             _uiState.update { it.copy(businessData = fresh, currentTab = BizzlyTab.HOME, currentTable = null) }
             if (acc != null) {
-                viewModelScope.launch(Dispatchers.IO) { repository.saveBusinessData(acc.id, fresh) }
+                viewModelScope.launch(Dispatchers.IO) {
+                    persistMutex.withLock {
+                        repository.saveBusinessData(acc.id, fresh)
+                        inventoryRepository.deleteAllForBusiness(acc.id)
+                    }
+                }
                 scheduleSync()
             }
             showToast("Données réinitialisées.")
@@ -1880,8 +2476,17 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         if (!requireSensitivePin(BizzlyPermissions.RESTORE) { restoreBackupInSession(uri) }) return
         val acc = _uiState.value.activeAccount ?: return
         viewModelScope.launch {
+            var oversized = false
             val raw = withContext(Dispatchers.IO) {
-                getApplication<Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                getApplication<Application>().contentResolver.openInputStream(uri)?.use { stream ->
+                    val txt = BizzlyRepository.readStreamBoundedUtf8(stream)
+                    if (txt == null) oversized = true
+                    txt
+                }
+            }
+            if (oversized) {
+                showToast("Fichier trop volumineux (max 10 Mo).")
+                return@launch
             }
             if (raw == null) {
                 showToast("Impossible de lire le fichier.")
@@ -1907,7 +2512,9 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
                 val logged = appendLog(synced, "Sauvegarde restaurée")
                 _uiState.update { it.copy(businessData = logged, currentTab = BizzlyTab.HOME, currentTable = null) }
                 viewModelScope.launch(Dispatchers.IO) {
-                    repository.saveBusinessData(acc.id, logged)
+                    persistMutex.withLock {
+                        repository.saveBusinessData(acc.id, logged)
+                    }
                 }
                 scheduleSync()
                 showToast("Sauvegarde restaurée")
@@ -1921,7 +2528,9 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         val updatedData = _uiState.value.businessData.copy(lbk = today)
         _uiState.update { it.copy(businessData = updatedData) }
         viewModelScope.launch(Dispatchers.IO) {
-            repository.saveBusinessData(acc.id, updatedData)
+            persistMutex.withLock {
+                repository.saveBusinessData(acc.id, updatedData)
+            }
         }
         val filename = "${BizzlyCalculator.slugify(acc.ident)}-sauvegarde-$today.json"
         val jsonStr = repository.createBackupJson(acc, updatedData)
@@ -1960,27 +2569,170 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun shareTableInvoicePdf(tableNumber: Int) {
+    fun shareTableInvoicePdf(tableNumber: Int, isProforma: Boolean = false) {
+        val perm = if (isProforma) BizzlyPermissions.COMMANDE else BizzlyPermissions.ENCAISSER
+        if (!requirePermission(perm) { shareTableInvoicePdf(tableNumber, isProforma) }) return
         val st = _uiState.value
         val acc = st.activeAccount
         val data = st.businessData
-        val cashGiven = if (st.paymentMode == "Espèces") st.cashGivenText.toDoubleOrNull() ?: 0.0 else 0.0
+        val tbl = data.tb[tableNumber.toString()] ?: OpenTable()
+        val breakdown = BizzlyCalculator.calculateTableBreakdown(data, tbl)
+        val due = breakdown.remainingDue
+        val payments = if (st.paymentMode == "Mixte") {
+            val amt1 = st.mixedAmount1Text.toDoubleOrNull()?.coerceIn(0.0, due) ?: 0.0
+            if (amt1 > 0.0 && amt1 < due) {
+                listOf(PaymentPart(st.mixedMode1, amt1), PaymentPart(st.mixedMode2, due - amt1))
+            } else emptyList()
+        } else emptyList()
+        val cashGiven = if (st.paymentMode == "Espèces" || (st.paymentMode == "Mixte" && (st.mixedMode1 == "Espèces" || st.mixedMode2 == "Espèces"))) {
+            st.cashGivenText.toDoubleOrNull() ?: 0.0
+        } else 0.0
+
         _uiState.update { it.copy(exportBusy = true) }
         viewModelScope.launch {
             runCatching {
                 val bytes = withContext(Dispatchers.IO) {
-                    ExportUtils.generateInvoicePdf(acc, data, tableNumber, st.paymentMode, cashGiven)
+                    ExportUtils.generateInvoicePdf(
+                        account = acc,
+                        data = data,
+                        tableNumber = tableNumber,
+                        paymentMode = st.paymentMode,
+                        cashGiven = cashGiven,
+                        payments = payments,
+                        isProforma = isProforma
+                    )
                 }
-                val filename = "facture-${BizzlyCalculator.slugify(acc?.name)}-table-$tableNumber-${BizzlyCalculator.todayIso()}.pdf"
+                val prefix = if (isProforma) "note" else "facture"
+                val filename = "$prefix-${BizzlyCalculator.slugify(acc?.name)}-table-$tableNumber-${BizzlyCalculator.todayIso()}.pdf"
                 publishExport(
                     filename = filename,
                     bytes = bytes,
                     mimeType = "application/pdf",
-                    chooserTitle = "Facture Table $tableNumber"
+                    chooserTitle = if (isProforma) "Note de table $tableNumber" else "Facture Table $tableNumber"
                 )
             }.onFailure {
                 _uiState.update { s -> s.copy(exportBusy = false) }
-                showToast("Impossible de générer la facture PDF.")
+                showToast("Impossible de générer le PDF.")
+            }
+        }
+    }
+
+    // --- Bluetooth Thermal Printing (ESC/POS 58mm / 80mm) ---
+
+    fun refreshPairedPrinters() {
+        if (!_uiState.value.isLoggedIn) return
+        val list = EscPosPrinter.listPairedPrinters(getApplication())
+        _uiState.update { it.copy(pairedPrinters = list) }
+    }
+
+    fun selectPrinter(device: BluetoothPrinterDevice) {
+        if (!_uiState.value.isLoggedIn || !can(BizzlyPermissions.COMMANDE)) return
+        repository.setPrinterAddress(device.address)
+        repository.setPrinterName(device.name)
+        _uiState.update { it.copy(printerAddress = device.address, printerName = device.name) }
+        showToast("Imprimante sélectionnée : ${device.name}")
+    }
+
+    fun clearSelectedPrinter() {
+        if (!_uiState.value.isLoggedIn || !can(BizzlyPermissions.COMMANDE)) return
+        repository.setPrinterAddress(null)
+        repository.setPrinterName(null)
+        _uiState.update { it.copy(printerAddress = null, printerName = null) }
+        showToast("Imprimante retirée.")
+    }
+
+    fun setPrinterWidthMm(mm: Int) {
+        if (!_uiState.value.isLoggedIn || !can(BizzlyPermissions.COMMANDE)) return
+        val clean = if (mm >= 80) 80 else 58
+        repository.setPrinterWidthMm(clean)
+        _uiState.update { it.copy(printerWidthMm = clean) }
+    }
+
+    fun printTestReceipt() {
+        if (!_uiState.value.isLoggedIn || !can(BizzlyPermissions.COMMANDE)) return
+        val st = _uiState.value
+        val addr = st.printerAddress
+        if (addr.isNullOrBlank()) {
+            showToast("Sélectionnez d’abord une imprimante Bluetooth.")
+            return
+        }
+        val width = PrinterPaperWidth.fromMm(st.printerWidthMm)
+        val payload = EscPosPrinter.buildTestReceipt(st.activeAccount, width)
+        sendToPrinter(addr, payload, "Test imprimé (${width.mm} mm).")
+    }
+
+    fun printTableReceipt(tableNumber: Int, isProforma: Boolean) {
+        val perm = if (isProforma) BizzlyPermissions.COMMANDE else BizzlyPermissions.ENCAISSER
+        if (!requirePermission(perm) { printTableReceipt(tableNumber, isProforma) }) return
+        val st = _uiState.value
+        val addr = st.printerAddress
+        if (addr.isNullOrBlank()) {
+            showToast("Configurez une imprimante Bluetooth (Entreprise ou bouton Imprimer).")
+            return
+        }
+        val tbl = st.businessData.tb[tableNumber.toString()] ?: return
+        val breakdown = BizzlyCalculator.calculateTableBreakdown(st.businessData, tbl)
+        val due = breakdown.remainingDue
+        val payments = if (st.paymentMode == "Mixte") {
+            val amt1 = st.mixedAmount1Text.toDoubleOrNull()?.coerceIn(0.0, due) ?: 0.0
+            if (amt1 > 0.0 && amt1 < due) {
+                listOf(PaymentPart(st.mixedMode1, amt1), PaymentPart(st.mixedMode2, due - amt1))
+            } else emptyList()
+        } else emptyList()
+        val cashGiven = if (!isProforma && (st.paymentMode == "Espèces" || st.paymentMode == "Mixte")) {
+            st.cashGivenText.toDoubleOrNull() ?: 0.0
+        } else 0.0
+
+        val width = PrinterPaperWidth.fromMm(st.printerWidthMm)
+        val payload = EscPosPrinter.buildTableReceipt(
+            account = st.activeAccount,
+            data = st.businessData,
+            tableNumber = tableNumber,
+            table = tbl,
+            paymentLabel = st.paymentMode,
+            payments = payments,
+            cashGiven = cashGiven,
+            isProforma = isProforma,
+            width = width
+        )
+        sendToPrinter(
+            addr,
+            payload,
+            if (isProforma) "Note de table $tableNumber imprimée." else "Ticket table $tableNumber imprimé."
+        )
+    }
+
+    fun printKitchenBarTicket(tableNumber: Int) {
+        if (!requirePermission(BizzlyPermissions.COMMANDE) { printKitchenBarTicket(tableNumber) }) return
+        val st = _uiState.value
+        val addr = st.printerAddress
+        if (addr.isNullOrBlank()) {
+            showToast("Configurez une imprimante Bluetooth (Entreprise ou bouton Imprimer).")
+            return
+        }
+        val tbl = st.businessData.tb[tableNumber.toString()] ?: return
+        val width = PrinterPaperWidth.fromMm(st.printerWidthMm)
+        val payload = EscPosPrinter.buildKitchenBarTicket(
+            account = st.activeAccount,
+            data = st.businessData,
+            tableNumber = tableNumber,
+            table = tbl,
+            width = width
+        )
+        sendToPrinter(addr, payload, "Bon cuisine/bar Table $tableNumber imprimé.")
+    }
+
+    private fun sendToPrinter(address: String, payload: ByteArray, successMessage: String) {
+        _uiState.update { it.copy(printerBusy = true) }
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                EscPosPrinter.printBytes(getApplication(), address, payload)
+            }
+            _uiState.update { it.copy(printerBusy = false) }
+            res.onSuccess {
+                showToast(successMessage)
+            }.onFailure { err ->
+                showToast(err.message ?: "Échec d’impression Bluetooth.")
             }
         }
     }
@@ -2153,6 +2905,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun disableCloudSync() {
+        if (!requireSensitivePin(BizzlyPermissions.RESET) { disableCloudSync() }) return
         val acc = _uiState.value.activeAccount ?: return
         askConfirm(
             "Désactiver la synchronisation sur ce téléphone ? Les données restent ici et en ligne. Vous pourrez la réactiver avec le code.",
@@ -2330,9 +3083,10 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setupAdminPasscode(installCode: String, code: String, confirm: String) {
-        val cleanInstall = installCode.trim().uppercase()
-        if (cleanInstall != "SETUP-VBZR-9AF0-NW4M-DQG2") {
-            _uiState.update { it.copy(admin = it.admin.copy(error = "Code d'installation incorrect.")) }
+        val installLockKey = "admin:install"
+        val waitMsg = lockout.checkWaitMessage(installLockKey)
+        if (waitMsg != null) {
+            _uiState.update { it.copy(admin = it.admin.copy(error = waitMsg)) }
             return
         }
         val clean = code.trim()
@@ -2350,6 +3104,22 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
         }
         _uiState.update { it.copy(admin = it.admin.copy(busy = true, error = "")) }
         viewModelScope.launch {
+            val installOk = withContext(Dispatchers.Default) {
+                PinSecurity.verifyAdminInstallCode(installCode)
+            }
+            if (!installOk) {
+                val lockMsg = lockout.recordFailure(installLockKey)
+                _uiState.update {
+                    it.copy(
+                        admin = it.admin.copy(
+                            busy = false,
+                            error = lockMsg ?: "Code d'installation incorrect."
+                        )
+                    )
+                }
+                return@launch
+            }
+            lockout.reset(installLockKey)
             val (salt, hash) = withContext(Dispatchers.Default) { PinSecurity.createCredentialHash(clean) }
             repository.saveAdminCredential(salt, hash)
             _uiState.update {
@@ -2476,7 +3246,16 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateAdminPasscode(currentCode: String, newCode: String, confirm: String) {
+        if (!_uiState.value.admin.isAuthenticated) return
         val hasExisting = repository.hasAdminCredential()
+        val lockKey = "admin:kltur"
+        if (hasExisting) {
+            val waitMsg = lockout.checkWaitMessage(lockKey)
+            if (waitMsg != null) {
+                showToast(waitMsg)
+                return
+            }
+        }
         val cleanNew = newCode.trim()
         if (cleanNew.length < 4 || cleanNew.length > 32) {
             showToast("Le nouveau code doit contenir 4 à 32 caractères.")
@@ -2494,9 +3273,11 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
             if (hasExisting) {
                 val ok = withContext(Dispatchers.Default) { repository.verifyAdminCredential(currentCode.trim()) }
                 if (!ok) {
-                    showToast("Code actuel incorrect.")
+                    val lockMsg = lockout.recordFailure(lockKey)
+                    showToast(lockMsg ?: "Code actuel incorrect.")
                     return@launch
                 }
+                lockout.reset(lockKey)
             }
             val (salt, hash) = withContext(Dispatchers.Default) { PinSecurity.createCredentialHash(cleanNew) }
             repository.saveAdminCredential(salt, hash)
@@ -2506,6 +3287,7 @@ class BizzlyViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun saveNetlifyAdminUrl(rawUrl: String) {
+        if (!_uiState.value.admin.isAuthenticated) return
         val clean = rawUrl.trim()
         if (clean.isNotEmpty() && !repository.isValidHttpsUrl(clean)) {
             showToast("Utilisez une adresse HTTPS valide (ex. https://votre-admin.netlify.app).")

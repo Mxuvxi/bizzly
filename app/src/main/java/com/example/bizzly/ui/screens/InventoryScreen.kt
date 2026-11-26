@@ -1,6 +1,10 @@
 package com.example.bizzly.ui.screens
 
+import android.Manifest
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,17 +23,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ShoppingCartCheckout
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -43,15 +47,17 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -64,17 +70,12 @@ import com.example.bizzly.model.BizzlyTab
 import com.example.bizzly.ui.components.BizzlyCard
 import com.example.bizzly.ui.components.BizzlyHeroHeader
 import com.example.bizzly.ui.components.BizzlySignatureFooter
+import com.example.bizzly.ui.components.bringIntoViewOnIme
 import com.example.bizzly.ui.theme.LocalBizzlyTokens
 import com.example.bizzly.ui.theme.SoraFontFamily
 import com.example.bizzly.ui.viewmodel.BizzlyUiState
 import com.example.bizzly.ui.viewmodel.BizzlyViewModel
-
-private enum class InventoryFilter(val label: String) {
-    ALL("Tous"),
-    ALERTS("En alerte"),
-    OUT_OF_STOCK("Rupture"),
-    HEALTHY("OK")
-}
+import com.example.bizzly.util.NotificationHelper
 
 @Composable
 fun InventoryScreen(
@@ -87,7 +88,7 @@ fun InventoryScreen(
 
     Column(modifier = Modifier.fillMaxWidth()) {
         BizzlyHeroHeader(
-            subtitle = "Inventaire & alertes de seuil",
+            subtitle = "Inventaire & alertes de stock",
             account = state.activeAccount,
             roleLabel = state.activeProfile?.let { BizzlyRole.fromKey(it.role).label },
             syncStatus = state.syncStatus,
@@ -101,7 +102,7 @@ fun InventoryScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(48.dp)
-                    .testTag("inventory_back_btn")
+                    .testTag("inv_back_more_btn")
             ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = tokens.onHeader)
                 Spacer(modifier = Modifier.width(8.dp))
@@ -120,46 +121,42 @@ fun InventoryTrackerContent(
     viewModel: BizzlyViewModel
 ) {
     val tokens = LocalBizzlyTokens.current
+    val context = LocalContext.current
     val items by viewModel.inventoryItems.collectAsStateWithLifecycle()
     val lowStockItems by viewModel.lowStockInventoryItems.collectAsStateWithLifecycle()
+    val role = state.activeProfile?.let { BizzlyRole.fromKey(it.role) }
+    val canReceiveNotif = role == BizzlyRole.GERANT || role == BizzlyRole.CAISSE
+    var hasNotifPerm by remember { mutableStateOf(NotificationHelper.hasNotificationPermission(context)) }
+    val notifLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasNotifPerm = granted || NotificationHelper.hasNotificationPermission(context)
+    }
 
     var searchQuery by remember { mutableStateOf("") }
-    var activeFilter by remember { mutableStateOf(InventoryFilter.ALL) }
-    var selectedCategory by remember { mutableStateOf("Toutes") }
-    var defaultThresholdText by remember(state.businessData.seuil) {
-        mutableStateOf(state.businessData.seuil.toString())
-    }
-    var showFormDialog by remember { mutableStateOf(false) }
+    var filterMode by remember { mutableIntStateOf(0) } // 0 = Tous, 1 = Alertes, 2 = Ruptures
+    var editorVisible by remember { mutableStateOf(false) }
     var editingItem by remember { mutableStateOf<InventoryItemEntity?>(null) }
-    var quickAdjustItem by remember { mutableStateOf<InventoryItemEntity?>(null) }
+    var quickQtyItem by remember { mutableStateOf<InventoryItemEntity?>(null) }
+    var restockDialogOpen by remember { mutableStateOf(false) }
 
-    val outOfStockCount = remember(items) { items.count { it.stockStatus() == InventoryStockStatus.OUT_OF_STOCK } }
-    val lowOnlyCount = remember(items) { items.count { it.stockStatus() == InventoryStockStatus.LOW_STOCK } }
-    val alertCount = outOfStockCount + lowOnlyCount
-    val healthyCount = items.size - alertCount
-    val totalValue = remember(items) { items.sumOf { it.quantity * it.unitPrice } }
+    val outOfStockCount = remember(items) { items.count { it.quantity <= 0.0 } }
+    val lowOnlyCount = remember(items) { items.count { it.quantity > 0.0 && it.isBelowThreshold } }
+    val totalValue = remember(items) { items.sumOf { (it.quantity * it.unitPrice).coerceAtLeast(0.0) } }
 
-    val categories = remember(items) {
-        val distinct = items.map { it.category.ifBlank { "Général" } }.distinct().sorted()
-        if (distinct.size > 1) listOf("Toutes") + distinct else emptyList()
-    }
-
-    val filteredItems = remember(items, searchQuery, activeFilter, selectedCategory) {
+    val filteredItems = remember(items, searchQuery, filterMode) {
         val q = searchQuery.trim().lowercase()
         items.filter { item ->
-            val matchesFilter = when (activeFilter) {
-                InventoryFilter.ALL -> true
-                InventoryFilter.ALERTS -> item.isBelowThreshold
-                InventoryFilter.OUT_OF_STOCK -> item.stockStatus() == InventoryStockStatus.OUT_OF_STOCK
-                InventoryFilter.HEALTHY -> !item.isBelowThreshold
+            val matchesFilter = when (filterMode) {
+                1 -> item.isBelowThreshold
+                2 -> item.quantity <= 0.0
+                else -> true
             }
-            val matchesCat = selectedCategory == "Toutes" ||
-                item.category.equals(selectedCategory, ignoreCase = true)
             val matchesSearch = q.isEmpty() ||
                 item.name.lowercase().contains(q) ||
-                item.sku.lowercase().contains(q) ||
-                item.category.lowercase().contains(q)
-            matchesFilter && matchesCat && matchesSearch
+                item.category.lowercase().contains(q) ||
+                item.sku.lowercase().contains(q)
+            matchesFilter && matchesSearch
         }
     }
 
@@ -169,68 +166,113 @@ fun InventoryTrackerContent(
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Live Low-Stock Alert Banner
-        if (lowStockItems.isNotEmpty()) {
-            val isCritical = outOfStockCount > 0
-            val alertColor = if (isCritical) tokens.ko else tokens.warn
-            BizzlyCard(
-                borderColor = alertColor,
-                modifier = Modifier.testTag("inventory_alert_banner")
-            ) {
+        if (canReceiveNotif && !hasNotifPerm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            BizzlyCard(borderColor = tokens.primary) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(alertColor.copy(alpha = 0.14f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (isCritical) Icons.Default.WarningAmber else Icons.Default.NotificationsActive,
-                            contentDescription = "Alerte stock",
-                            tint = alertColor
-                        )
-                    }
+                    Icon(Icons.Default.NotificationsActive, contentDescription = null, tint = tokens.primary)
                     Column(modifier = Modifier.weight(1f)) {
+                        Text("Notifications de stock critique", fontWeight = FontWeight.Bold, color = tokens.text, fontSize = 13.5.sp)
                         Text(
-                            text = if (isCritical) {
-                                "$outOfStockCount rupture${if (outOfStockCount > 1) "s" else ""} · ${lowStockItems.size} article${if (lowStockItems.size > 1) "s" else ""} en alerte"
-                            } else {
-                                "${lowStockItems.size} article${if (lowStockItems.size > 1) "s" else ""} sous le seuil défini"
-                            },
-                            fontFamily = SoraFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.5.sp,
-                            color = tokens.text
-                        )
-                        Text(
-                            text = lowStockItems.take(4).joinToString(" · ") {
-                                "${it.name} (${BizzlyCalculator.formatQty(it.quantity)}/${BizzlyCalculator.formatQty(it.minThreshold)})"
-                            } + if (lowStockItems.size > 4) " …" else "",
-                            fontSize = 12.5.sp,
+                            text = "Recevez une alerte dès qu’un article passe sous son seuil.",
+                            fontSize = 12.sp,
                             color = tokens.muted
                         )
                     }
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = { activeFilter = InventoryFilter.ALERTS },
-                    border = BorderStroke(1.dp, alertColor.copy(alpha = 0.6f)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                        .testTag("inv_filter_alerts_quick_btn")
-                ) {
-                    Text("Afficher uniquement les alertes (${lowStockItems.size})", color = alertColor, fontWeight = FontWeight.SemiBold)
+                    Button(
+                        onClick = { notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = tokens.primary,
+                            contentColor = tokens.onPrimary
+                        ),
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("inv_enable_notif_btn")
+                    ) {
+                        Text("Activer", fontSize = 12.5.sp)
+                    }
                 }
             }
         }
 
-        // 3 KPI Summary Row
+        if (lowStockItems.isNotEmpty()) {
+            val alertColor = if (outOfStockCount > 0) tokens.ko else tokens.warn
+            BizzlyCard(
+                borderColor = alertColor,
+                modifier = Modifier.testTag("inv_low_stock_banner")
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.WarningAmber,
+                        contentDescription = null,
+                        tint = alertColor,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "${lowStockItems.size} alerte${if (lowStockItems.size > 1) "s" else ""} de seuil",
+                            fontWeight = FontWeight.Bold,
+                            color = tokens.text
+                        )
+                        val detailParts = buildList {
+                            if (outOfStockCount > 0) add("$outOfStockCount en rupture")
+                            if (lowOnlyCount > 0) add("$lowOnlyCount sous le seuil")
+                        }
+                        if (detailParts.isNotEmpty()) {
+                            Text(
+                                text = detailParts.joinToString(" · "),
+                                fontSize = 12.5.sp,
+                                color = alertColor,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { filterMode = if (filterMode == 1) 0 else 1 },
+                        border = BorderStroke(1.dp, alertColor),
+                        modifier = Modifier.height(48.dp)
+                    ) {
+                        Text(
+                            text = if (filterMode == 1) "Tout voir" else "Filtrer",
+                            color = alertColor,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = lowStockItems.take(5).joinToString(" · ") {
+                        "${it.name} (${BizzlyCalculator.formatQty(it.quantity)}/${BizzlyCalculator.formatQty(it.minThreshold)})"
+                    } + if (lowStockItems.size > 5) " …" else "",
+                    fontSize = 12.5.sp,
+                    color = tokens.muted
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { restockDialogOpen = true },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = alertColor,
+                        contentColor = Color.White
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("inv_restock_order_btn")
+                ) {
+                    Icon(Icons.Default.ShoppingCartCheckout, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Bon de commande fournisseur (${lowStockItems.size})", fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        // KPI Row
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -238,24 +280,24 @@ fun InventoryTrackerContent(
             InventoryKpiBox(
                 label = "Articles",
                 value = items.size.toString(),
-                accent = tokens.accentReadable,
+                valueColor = tokens.text,
                 modifier = Modifier.weight(1f)
             )
             InventoryKpiBox(
-                label = "En alerte",
-                value = alertCount.toString(),
-                accent = if (outOfStockCount > 0) tokens.ko else if (alertCount > 0) tokens.warn else tokens.ok,
+                label = "Alertes",
+                value = lowStockItems.size.toString(),
+                valueColor = if (lowStockItems.isNotEmpty()) tokens.ko else tokens.ok,
                 modifier = Modifier.weight(1f)
             )
             InventoryKpiBox(
-                label = "Valeur estimée",
+                label = "Valeur",
                 value = BizzlyCalculator.formatFcfa(totalValue),
-                accent = tokens.text,
-                modifier = Modifier.weight(1.3f)
+                valueColor = tokens.accentReadable,
+                modifier = Modifier.weight(1.35f)
             )
         }
 
-        // Actions & Global Threshold Bar
+        // Actions + Search + Filters
         BizzlyCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -264,146 +306,137 @@ fun InventoryTrackerContent(
                 Button(
                     onClick = {
                         editingItem = null
-                        showFormDialog = true
+                        editorVisible = true
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = tokens.primary,
                         contentColor = tokens.onPrimary
                     ),
                     modifier = Modifier
-                        .weight(1f)
+                        .weight(1.2f)
                         .height(48.dp)
                         .testTag("inv_add_item_btn")
                 ) {
-                    Icon(Icons.Default.Add, contentDescription = null)
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Nouvel article", fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text("Ajouter un article", fontWeight = FontWeight.SemiBold, maxLines = 1)
                 }
-
                 if (state.businessData.prod.isNotEmpty()) {
                     OutlinedButton(
-                        onClick = viewModel::importCatalogToInventory,
-                        border = BorderStroke(1.dp, tokens.border),
+                        onClick = viewModel::syncInventoryFromCatalog,
                         modifier = Modifier
+                            .weight(0.9f)
                             .height(48.dp)
-                            .testTag("inv_import_catalog_btn")
+                            .testTag("inv_sync_catalog_btn")
                     ) {
-                        Icon(Icons.Default.Download, contentDescription = null, tint = tokens.accentReadable)
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(Icons.Default.Sync, contentDescription = null, tint = tokens.accentReadable, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text("Catalogue", color = tokens.text, maxLines = 1)
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "Seuil global",
-                    fontSize = 13.sp,
-                    color = tokens.muted,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedTextField(
-                    value = defaultThresholdText,
-                    onValueChange = { defaultThresholdText = it.filter { ch -> ch.isDigit() } },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier
-                        .width(88.dp)
-                        .testTag("inv_global_threshold_input")
-                )
-                OutlinedButton(
-                    onClick = {
-                        defaultThresholdText.toIntOrNull()?.let { viewModel.applyDefaultInventoryThreshold(it) }
-                    },
-                    border = BorderStroke(1.dp, tokens.border),
-                    modifier = Modifier
-                        .height(48.dp)
-                        .testTag("inv_apply_global_threshold_btn")
+            if (state.businessData.prod.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Appliquer", color = tokens.accentReadable, fontWeight = FontWeight.SemiBold)
+                    OutlinedButton(
+                        onClick = viewModel::syncBarToInventory,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("inv_sync_bar_to_inv_btn")
+                    ) {
+                        Text("Comptage Bar → Inv.", color = tokens.text, fontSize = 12.sp, maxLines = 1)
+                    }
+                    OutlinedButton(
+                        onClick = viewModel::syncInventoryToBar,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("inv_sync_inv_to_bar_btn")
+                    ) {
+                        Text("Inv. → Comptage Bar", color = tokens.text, fontSize = 12.sp, maxLines = 1)
+                    }
                 }
             }
-        }
 
-        // Search & Filter Chips
-        BizzlyCard {
+            Spacer(modifier = Modifier.height(10.dp))
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
-                placeholder = { Text("Rechercher (nom, SKU, catégorie)") },
+                placeholder = { Text("Rechercher article, catégorie, SKU") },
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
+                    .bringIntoViewOnIme()
                     .testTag("inv_search_input")
             )
+
             Spacer(modifier = Modifier.height(8.dp))
             FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                val counts = mapOf(
-                    InventoryFilter.ALL to items.size,
-                    InventoryFilter.ALERTS to alertCount,
-                    InventoryFilter.OUT_OF_STOCK to outOfStockCount,
-                    InventoryFilter.HEALTHY to healthyCount
+                FilterChip(
+                    selected = filterMode == 0,
+                    onClick = { filterMode = 0 },
+                    label = { Text("Tous (${items.size})") },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = tokens.primary,
+                        selectedLabelColor = tokens.onPrimary
+                    ),
+                    modifier = Modifier.testTag("inv_filter_all")
                 )
-                InventoryFilter.entries.forEach { filter ->
-                    val count = counts[filter] ?: 0
-                    FilterChip(
-                        selected = activeFilter == filter,
-                        onClick = { activeFilter = filter },
-                        label = { Text("${filter.label} ($count)", fontSize = 12.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = tokens.tint,
-                            selectedLabelColor = tokens.accentReadable
-                        ),
-                        modifier = Modifier.testTag("inv_filter_${filter.name.lowercase()}")
-                    )
-                }
-            }
-            if (categories.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(4.dp))
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    categories.forEach { cat ->
-                        FilterChip(
-                            selected = selectedCategory == cat,
-                            onClick = { selectedCategory = cat },
-                            label = { Text(cat, fontSize = 11.5.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = tokens.primary.copy(alpha = 0.14f),
-                                selectedLabelColor = tokens.accentReadable
-                            )
-                        )
-                    }
-                }
+                FilterChip(
+                    selected = filterMode == 1,
+                    onClick = { filterMode = 1 },
+                    label = { Text("Sous seuil (${lowStockItems.size})") },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = tokens.warn,
+                        selectedLabelColor = Color.White
+                    ),
+                    modifier = Modifier.testTag("inv_filter_low")
+                )
+                FilterChip(
+                    selected = filterMode == 2,
+                    onClick = { filterMode = 2 },
+                    label = { Text("Ruptures ($outOfStockCount)") },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = tokens.ko,
+                        selectedLabelColor = Color.White
+                    ),
+                    modifier = Modifier.testTag("inv_filter_out")
+                )
             }
         }
 
-        // Item List
         if (filteredItems.isEmpty()) {
             BizzlyCard {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(Icons.Default.Inventory2, contentDescription = null, tint = tokens.muted)
+                    Icon(
+                        imageVector = Icons.Default.Inventory2,
+                        contentDescription = null,
+                        tint = tokens.muted,
+                        modifier = Modifier.size(36.dp)
+                    )
                     Text(
                         text = if (items.isEmpty()) {
-                            "Aucun article dans l’inventaire local. Touchez « Nouvel article » ou importez le catalogue."
+                            "Aucun article dans l’inventaire."
                         } else {
-                            "Aucun article ne correspond aux filtres actuels."
+                            "Aucun article ne correspond à ce filtre."
                         },
                         color = tokens.muted,
-                        fontSize = 13.5.sp
+                        fontSize = 14.sp
                     )
                 }
             }
@@ -411,13 +444,14 @@ fun InventoryTrackerContent(
             filteredItems.forEach { item ->
                 InventoryItemCard(
                     item = item,
-                    onAdjust = { delta -> viewModel.adjustInventoryQuantity(item.id, delta) },
-                    onQuickAdjustClick = { quickAdjustItem = item },
-                    onEditClick = {
+                    onDecrement = { viewModel.adjustInventoryQuantity(item, -1.0) },
+                    onIncrement = { viewModel.adjustInventoryQuantity(item, 1.0) },
+                    onQuickQty = { quickQtyItem = item },
+                    onEdit = {
                         editingItem = item
-                        showFormDialog = true
+                        editorVisible = true
                     },
-                    onDeleteClick = { viewModel.deleteInventoryItem(item.id) }
+                    onDelete = { viewModel.deleteInventoryItem(item) }
                 )
             }
         }
@@ -425,26 +459,51 @@ fun InventoryTrackerContent(
         BizzlySignatureFooter()
     }
 
-    if (showFormDialog) {
-        InventoryItemFormDialog(
-            editingItem = editingItem,
+    if (editorVisible) {
+        InventoryItemEditorDialog(
+            initial = editingItem,
             defaultThreshold = state.businessData.seuil,
-            onDismiss = { showFormDialog = false },
-            onSave = { id, name, sku, category, unit, qty, minTh, price, notes ->
-                viewModel.saveInventoryItem(id, name, sku, category, unit, qty, minTh, price, notes)
-                showFormDialog = false
-            }
+            onSave = { id, name, sku, category, unit, quantity, minThreshold, unitPrice, notes ->
+                viewModel.saveInventoryItem(
+                    id = id,
+                    name = name,
+                    sku = sku,
+                    category = category,
+                    unit = unit,
+                    quantity = quantity,
+                    minThreshold = minThreshold,
+                    unitPrice = unitPrice,
+                    notes = notes
+                )
+                editorVisible = false
+            },
+            onDismiss = { editorVisible = false }
         )
     }
 
-    quickAdjustItem?.let { target ->
-        InventoryQuickAdjustDialog(
+    quickQtyItem?.let { target ->
+        InventoryQuickQtyDialog(
             item = target,
-            onDismiss = { quickAdjustItem = null },
-            onConfirm = { qtyRaw, thRaw ->
-                viewModel.setInventoryQuantityAndThreshold(target.id, qtyRaw, thRaw)
-                quickAdjustItem = null
-            }
+            onApplyExact = { qty ->
+                viewModel.setInventoryQuantity(target, qty)
+                quickQtyItem = null
+            },
+            onDismiss = { quickQtyItem = null }
+        )
+    }
+
+    if (restockDialogOpen && lowStockItems.isNotEmpty()) {
+        RestockOrderDialog(
+            lowStockItems = lowStockItems,
+            onExportPdf = { supplier, lines ->
+                restockDialogOpen = false
+                viewModel.exportRestockOrderPdf(supplier, lines)
+            },
+            onExportExcel = { supplier, lines ->
+                restockDialogOpen = false
+                viewModel.exportRestockOrderExcel(supplier, lines)
+            },
+            onDismiss = { restockDialogOpen = false }
         )
     }
 }
@@ -453,19 +512,25 @@ fun InventoryTrackerContent(
 private fun InventoryKpiBox(
     label: String,
     value: String,
-    accent: androidx.compose.ui.graphics.Color,
+    valueColor: Color,
     modifier: Modifier = Modifier
 ) {
     val tokens = LocalBizzlyTokens.current
-    BizzlyCard(modifier = modifier) {
-        Text(label, fontSize = 11.5.sp, color = tokens.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(tokens.card)
+            .border(1.dp, tokens.border, RoundedCornerShape(14.dp))
+            .padding(12.dp)
+    ) {
+        Text(text = label, fontSize = 12.sp, color = tokens.muted)
         Spacer(modifier = Modifier.height(2.dp))
         Text(
             text = value,
             fontFamily = SoraFontFamily,
             fontWeight = FontWeight.Bold,
-            fontSize = 15.5.sp,
-            color = accent,
+            fontSize = 16.sp,
+            color = valueColor,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -475,10 +540,11 @@ private fun InventoryKpiBox(
 @Composable
 private fun InventoryItemCard(
     item: InventoryItemEntity,
-    onAdjust: (Double) -> Unit,
-    onQuickAdjustClick: () -> Unit,
-    onEditClick: () -> Unit,
-    onDeleteClick: () -> Unit
+    onDecrement: () -> Unit,
+    onIncrement: () -> Unit,
+    onQuickQty: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val tokens = LocalBizzlyTokens.current
     val status = item.stockStatus()
@@ -489,59 +555,56 @@ private fun InventoryItemCard(
     }
     val statusLabel = when (status) {
         InventoryStockStatus.OUT_OF_STOCK -> "Rupture"
-        InventoryStockStatus.LOW_STOCK -> "Sous le seuil"
-        InventoryStockStatus.HEALTHY -> "Stock OK"
+        InventoryStockStatus.LOW_STOCK -> "Stock bas"
+        InventoryStockStatus.HEALTHY -> "En stock"
     }
-    val targetReference = (item.minThreshold * 2.0).coerceAtLeast(1.0)
-    val progress = (item.quantity / targetReference).toFloat().coerceIn(0f, 1f)
+    val borderColor = when (status) {
+        InventoryStockStatus.OUT_OF_STOCK -> tokens.ko
+        InventoryStockStatus.LOW_STOCK -> tokens.warn
+        InventoryStockStatus.HEALTHY -> null
+    }
 
-    BizzlyCard(
-        borderColor = if (item.isBelowThreshold) statusColor else null,
-        modifier = Modifier.testTag("inv_item_card_${item.id}")
-    ) {
+    BizzlyCard(borderColor = borderColor, modifier = Modifier.testTag("inv_item_card_${item.id}")) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(statusColor)
+            )
             Column(modifier = Modifier.weight(1f)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(9.dp)
-                            .clip(CircleShape)
-                            .background(statusColor)
-                    )
+                Text(
+                    text = item.name,
+                    fontWeight = FontWeight.Bold,
+                    color = tokens.text,
+                    fontSize = 15.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val metaParts = buildList {
+                    if (item.category.isNotBlank()) add(item.category)
+                    if (item.sku.isNotBlank()) add("SKU ${item.sku}")
+                    if (item.unitPrice > 0.0) add(BizzlyCalculator.formatFcfa(item.unitPrice))
+                }
+                if (metaParts.isNotEmpty()) {
                     Text(
-                        text = item.name,
-                        fontWeight = FontWeight.Bold,
-                        color = tokens.text,
+                        text = metaParts.joinToString(" · "),
+                        fontSize = 12.sp,
+                        color = tokens.muted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                val metaParts = buildList {
-                    add(item.category.ifBlank { "Général" })
-                    if (item.sku.isNotBlank()) add("SKU ${item.sku}")
-                    if (item.unitPrice > 0.0) add(BizzlyCalculator.formatFcfa(item.unitPrice))
-                }
-                Text(
-                    text = metaParts.joinToString(" · "),
-                    fontSize = 12.sp,
-                    color = tokens.muted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
             }
-
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(99.dp))
                     .background(statusColor.copy(alpha = 0.14f))
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                    .padding(horizontal = 9.dp, vertical = 4.dp)
             ) {
                 Text(
                     text = statusLabel,
@@ -552,48 +615,54 @@ private fun InventoryItemCard(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
+        val denominator = (item.minThreshold * 2.0).coerceAtLeast(1.0)
+        val progress = (item.quantity / denominator).toFloat().coerceIn(0f, 1f)
         LinearProgressIndicator(
             progress = { progress },
             color = statusColor,
-            trackColor = tokens.border.copy(alpha = 0.5f),
+            trackColor = tokens.border,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(6.dp)
                 .clip(RoundedCornerShape(99.dp))
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(onClick = onQuickQty)
+                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                    .testTag("inv_quick_qty_btn_${item.id}")
+            ) {
                 Text(
-                    text = "Seuil : ${BizzlyCalculator.formatQty(item.minThreshold)} ${item.unit}",
-                    fontSize = 12.5.sp,
+                    text = "${BizzlyCalculator.formatQty(item.quantity)} ${item.unit}",
+                    fontFamily = SoraFontFamily,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    color = if (item.isBelowThreshold) statusColor else tokens.text
+                )
+                Text(
+                    text = "Seuil min : ${BizzlyCalculator.formatQty(item.minThreshold)} ${item.unit}",
+                    fontSize = 12.sp,
                     color = tokens.muted
                 )
-                if (item.notes.isNotBlank()) {
-                    Text(
-                        text = item.notes,
-                        fontSize = 11.5.sp,
-                        color = tokens.muted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
             }
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 IconButton(
-                    onClick = { onAdjust(-1.0) },
+                    onClick = onDecrement,
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(10.dp))
@@ -601,31 +670,10 @@ private fun InventoryItemCard(
                         .border(1.dp, tokens.border, RoundedCornerShape(10.dp))
                         .testTag("inv_minus_${item.id}")
                 ) {
-                    Icon(Icons.Default.Remove, contentDescription = "Diminuer le stock", tint = tokens.text)
+                    Icon(Icons.Default.Remove, contentDescription = "Retirer 1", tint = tokens.ko)
                 }
-
-                Box(
-                    modifier = Modifier
-                        .height(48.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(tokens.tint)
-                        .border(1.dp, statusColor.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
-                        .clickable(onClick = onQuickAdjustClick)
-                        .padding(horizontal = 12.dp)
-                        .testTag("inv_qty_btn_${item.id}"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "${BizzlyCalculator.formatQty(item.quantity)} ${item.unit}",
-                        fontFamily = SoraFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.5.sp,
-                        color = if (item.isBelowThreshold) statusColor else tokens.text
-                    )
-                }
-
                 IconButton(
-                    onClick = { onAdjust(1.0) },
+                    onClick = onIncrement,
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(10.dp))
@@ -633,49 +681,34 @@ private fun InventoryItemCard(
                         .border(1.dp, tokens.border, RoundedCornerShape(10.dp))
                         .testTag("inv_plus_${item.id}")
                 ) {
-                    Icon(Icons.Default.Add, contentDescription = "Augmenter le stock", tint = tokens.accentReadable)
+                    Icon(Icons.Default.Add, contentDescription = "Ajouter 1", tint = tokens.accentReadable)
                 }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (item.isBelowThreshold) {
-                OutlinedButton(
-                    onClick = { onAdjust(10.0) },
-                    border = BorderStroke(1.dp, tokens.accentReadable.copy(alpha = 0.5f)),
-                    modifier = Modifier
-                        .height(48.dp)
-                        .testTag("inv_restock_${item.id}")
-                ) {
-                    Text("+10 Réappro", fontSize = 12.5.sp, color = tokens.accentReadable, fontWeight = FontWeight.SemiBold)
-                }
-            } else {
-                Spacer(modifier = Modifier.width(1.dp))
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 IconButton(
-                    onClick = onEditClick,
+                    onClick = onEdit,
                     modifier = Modifier
                         .size(48.dp)
                         .testTag("inv_edit_${item.id}")
                 ) {
-                    Icon(Icons.Default.Edit, contentDescription = "Modifier l’article", tint = tokens.muted)
+                    Icon(Icons.Default.Edit, contentDescription = "Modifier", tint = tokens.muted)
                 }
                 IconButton(
-                    onClick = onDeleteClick,
+                    onClick = onDelete,
                     modifier = Modifier
                         .size(48.dp)
                         .testTag("inv_del_${item.id}")
                 ) {
-                    Icon(Icons.Default.Delete, contentDescription = "Supprimer l’article", tint = tokens.ko)
+                    Icon(Icons.Default.DeleteOutline, contentDescription = "Supprimer", tint = tokens.ko)
                 }
             }
+        }
+
+        if (item.notes.isNotBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = item.notes,
+                fontSize = 12.sp,
+                color = tokens.muted
+            )
         }
     }
 }

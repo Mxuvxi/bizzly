@@ -12,16 +12,24 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -55,12 +63,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -1038,47 +1052,139 @@ fun LogoThemeProposalsSection(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun BizzlySignatureFooter(
     onAdminClick: (() -> Unit)? = null
 ) {
     val tokens = LocalBizzlyTokens.current
     var tapCount by remember { mutableIntStateOf(0) }
+    var activeLegalTab by remember { mutableStateOf<LegalDocumentTab?>(null) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 20.dp, bottom = 10.dp)
-            .clickable(
-                indication = null,
-                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-            ) {
-                tapCount++
-                if (tapCount >= 5) {
-                    tapCount = 0
-                    onAdminClick?.invoke()
-                }
-            },
+            .padding(top = 18.dp, bottom = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(
-            text = "FAIT PAR",
-            fontSize = 10.sp,
-            letterSpacing = 2.sp,
-            color = tokens.muted.copy(alpha = 0.8f)
-        )
-        Text(
-            text = stringResource(id = R.string.signature_brand),
-            fontFamily = SoraFontFamily,
-            fontWeight = FontWeight.Bold,
-            fontSize = 13.sp,
-            letterSpacing = 1.2.sp,
-            color = tokens.text
-        )
-        Text(
-            text = stringResource(id = R.string.signature_author),
-            fontSize = 12.sp,
-            color = tokens.muted
+        Column(
+            modifier = Modifier
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+                ) {
+                    tapCount++
+                    if (tapCount >= 5) {
+                        tapCount = 0
+                        onAdminClick?.invoke()
+                    }
+                }
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "FAIT PAR",
+                fontSize = 10.sp,
+                letterSpacing = 2.sp,
+                color = tokens.muted.copy(alpha = 0.8f)
+            )
+            Text(
+                text = stringResource(id = R.string.signature_brand),
+                fontFamily = SoraFontFamily,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                letterSpacing = 1.2.sp,
+                color = tokens.text
+            )
+            Text(
+                text = stringResource(id = R.string.signature_author),
+                fontSize = 12.sp,
+                color = tokens.muted
+            )
+        }
+
+        FlowRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp),
+            horizontalArrangement = Arrangement.Center,
+            verticalArrangement = Arrangement.Center
+        ) {
+            TextButton(
+                onClick = { activeLegalTab = LegalDocumentTab.PRIVACY },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("footer_legal_privacy")
+            ) {
+                Text(
+                    text = "Confidentialité",
+                    fontSize = 11.5.sp,
+                    color = tokens.accentReadable
+                )
+            }
+            TextButton(
+                onClick = { activeLegalTab = LegalDocumentTab.TERMS },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("footer_legal_terms")
+            ) {
+                Text(
+                    text = "Conditions d’utilisation",
+                    fontSize = 11.5.sp,
+                    color = tokens.accentReadable
+                )
+            }
+            TextButton(
+                onClick = { activeLegalTab = LegalDocumentTab.LEGAL_NOTICE },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("footer_legal_notice")
+            ) {
+                Text(
+                    text = "Mentions légales",
+                    fontSize = 11.5.sp,
+                    color = tokens.accentReadable
+                )
+            }
+        }
+    }
+
+    if (activeLegalTab != null) {
+        LegalDocumentsDialog(
+            initialTab = activeLegalTab!!,
+            onDismiss = { activeLegalTab = null }
         )
     }
 }
+
+fun Modifier.bringIntoViewOnIme(): Modifier = composed {
+    val requester = remember { BringIntoViewRequester() }
+    var isFocused by remember { mutableStateOf(false) }
+    var fieldSize by remember { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current
+    val imeBottom = WindowInsets.ime.getBottom(density)
+
+    LaunchedEffect(isFocused, imeBottom) {
+        if (isFocused && imeBottom > 0) {
+            val extraPx = with(density) { 20.dp.toPx() }
+            val rect = if (fieldSize.width > 0 && fieldSize.height > 0) {
+                Rect(
+                    left = 0f,
+                    top = -extraPx,
+                    right = fieldSize.width.toFloat(),
+                    bottom = fieldSize.height.toFloat() + extraPx
+                )
+            } else null
+            requester.bringIntoView(rect)
+        }
+    }
+
+    this
+        .bringIntoViewRequester(requester)
+        .onSizeChanged { fieldSize = it }
+        .onFocusChanged { isFocused = it.isFocused }
+}
+

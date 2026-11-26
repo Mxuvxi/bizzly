@@ -32,7 +32,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
@@ -52,6 +51,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.bizzly.domain.BizzlyCalculator
 import com.example.bizzly.domain.ProductSalesItem
 import com.example.bizzly.domain.StockAlertLevel
@@ -225,33 +225,32 @@ fun HomeScreen(
                 )
             }
 
-            // Low stock inventory alert card (Room)
+            // Low stock alert card (Room Inventory)
             if (lowStockInventory.isNotEmpty()) {
-                val hasZero = lowStockInventory.any { it.quantity <= 0.0 }
-                val badgeColor = if (hasZero) tokens.ko else tokens.warn
+                val hasOut = lowStockInventory.any { it.quantity <= 0.0 }
                 BizzlyCard(
-                    borderColor = badgeColor,
-                    onClick = { viewModel.selectTab(BizzlyTab.INVENTORY) },
-                    modifier = Modifier.testTag("home_inventory_low_stock_card")
+                    borderColor = if (hasOut) tokens.ko else tokens.warn,
+                    onClick = { viewModel.selectTab(BizzlyTab.STOCK) },
+                    modifier = Modifier.testTag("home_low_stock_inventory_card")
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Box(
                             modifier = Modifier
                                 .size(11.dp)
                                 .clip(CircleShape)
-                                .background(badgeColor)
+                                .background(if (hasOut) tokens.ko else tokens.warn)
                         )
                         Text(
-                            text = "Alertes inventaire : ${lowStockInventory.size} article${if (lowStockInventory.size > 1) "s" else ""} sous le seuil",
+                            text = "Alertes inventaire : ${lowStockInventory.size} article${if (lowStockInventory.size > 1) "s" else ""}",
                             fontWeight = FontWeight.Bold,
                             color = tokens.text
                         )
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = lowStockInventory.take(5).joinToString(" · ") {
-                            "${it.name} (${BizzlyCalculator.formatQty(it.quantity)}/${BizzlyCalculator.formatQty(it.minThreshold)})"
-                        } + if (lowStockInventory.size > 5) " …" else "",
+                        text = lowStockInventory.take(6).joinToString(" · ") { item ->
+                            "${item.name} (${BizzlyCalculator.formatQty(item.quantity)})"
+                        } + if (lowStockInventory.size > 6) " …" else "",
                         fontSize = 13.sp,
                         color = tokens.muted
                     )

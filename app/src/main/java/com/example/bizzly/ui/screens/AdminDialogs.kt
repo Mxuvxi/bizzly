@@ -1,8 +1,6 @@
 package com.example.bizzly.ui.screens
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
+import com.example.bizzly.util.ExportUtils
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -154,7 +152,7 @@ fun AdminBusinessManageDialog(
                                 pinResetTargetId = prof.id
                                 pinResetValue = ""
                             },
-                            modifier = Modifier.height(44.dp)
+                            modifier = Modifier.height(48.dp)
                         ) {
                             Text("Reset PIN", color = tokens.text, fontSize = 12.sp)
                         }
@@ -212,13 +210,12 @@ fun AdminBusinessManageDialog(
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OutlinedButton(
                             onClick = {
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("Code Bizzly", formattedKey))
+                                ExportUtils.copySensitiveToClipboard(context, "Code Bizzly", formattedKey)
                                 viewModel.showToast("Code copié.")
                             },
                             modifier = Modifier
                                 .weight(1f)
-                                .height(46.dp)
+                                .height(48.dp)
                         ) {
                             Text("Copier code", color = tokens.text, fontSize = 12.sp)
                         }
@@ -227,7 +224,7 @@ fun AdminBusinessManageDialog(
                             enabled = !busy,
                             modifier = Modifier
                                 .weight(1f)
-                                .height(46.dp)
+                                .height(48.dp)
                         ) {
                             Text("Synchro", color = tokens.text, fontSize = 12.sp)
                         }
@@ -236,7 +233,7 @@ fun AdminBusinessManageDialog(
                         onClick = { viewModel.adminFetchSnapshots(acc.id) },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(46.dp)
+                            .height(48.dp)
                     ) {
                         Text("Voir copies cloud (14 jours)", color = tokens.text, fontSize = 12.5.sp)
                     }
@@ -269,7 +266,7 @@ fun AdminBusinessManageDialog(
                         onClick = { viewModel.adminExportExcel(acc.id) },
                         modifier = Modifier
                             .weight(1f)
-                            .height(46.dp)
+                            .height(48.dp)
                     ) {
                         Text("Excel", color = tokens.text, fontSize = 12.sp)
                     }
@@ -277,7 +274,7 @@ fun AdminBusinessManageDialog(
                         onClick = { viewModel.adminExportBilanPdf(acc.id) },
                         modifier = Modifier
                             .weight(1f)
-                            .height(46.dp)
+                            .height(48.dp)
                     ) {
                         Text("Bilan PDF", color = tokens.text, fontSize = 12.sp)
                     }
@@ -286,7 +283,7 @@ fun AdminBusinessManageDialog(
                     onClick = { viewModel.adminExportBackup(acc.id) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(46.dp)
+                        .height(48.dp)
                 ) {
                     Text("Sauvegarde complète (.json)", color = tokens.text, fontSize = 12.5.sp)
                 }
@@ -298,7 +295,7 @@ fun AdminBusinessManageDialog(
                     border = BorderStroke(1.dp, tokens.ko),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(46.dp)
+                        .height(48.dp)
                 ) {
                     Text("Supprimer de cet appareil", color = tokens.ko, fontSize = 12.5.sp)
                 }

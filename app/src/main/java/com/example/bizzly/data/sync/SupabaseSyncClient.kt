@@ -165,7 +165,22 @@ class SupabaseSyncClient(private val repository: BizzlyRepository) {
             }
         }
         for ((tableKey, tbl) in prepped.tb) {
-            docs["tb/$tableKey"] = canonicalJson(JsonObject(mapOf("sv" to JsonPrimitive(tbl.sv))))
+            val tbMap = LinkedHashMap<String, JsonElement>()
+            tbMap["sv"] = JsonPrimitive(tbl.sv)
+            if (tbl.comped.isNotEmpty()) {
+                tbMap["comped"] = JsonObject(tbl.comped.mapValues { JsonPrimitive(it.value) })
+            }
+            if (tbl.discountType != "none" && tbl.discountValue > 0.0) {
+                tbMap["discountType"] = JsonPrimitive(tbl.discountType)
+                tbMap["discountValue"] = JsonPrimitive(tbl.discountValue)
+            }
+            if (tbl.discountReason.isNotBlank()) {
+                tbMap["discountReason"] = JsonPrimitive(tbl.discountReason)
+            }
+            if (tbl.paidPartial > 0.0) tbMap["paidPartial"] = JsonPrimitive(tbl.paidPartial)
+            if (tbl.paidCount > 0) tbMap["paidCount"] = JsonPrimitive(tbl.paidCount)
+            if (tbl.splitTotalParts > 0) tbMap["splitTotalParts"] = JsonPrimitive(tbl.splitTotalParts)
+            docs["tb/$tableKey"] = canonicalJson(JsonObject(tbMap))
             for ((pidStr, q) in tbl.it) {
                 if (q != 0.0) {
                     docs["ti/$tableKey/$pidStr"] = if (q % 1.0 == 0.0) q.toLong().toString() else q.toString()
@@ -204,9 +219,8 @@ class SupabaseSyncClient(private val repository: BizzlyRepository) {
 
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val body = stream?.let {
-                BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).use { r -> r.readText() }
-            }.orEmpty()
+            val body = stream?.use { BizzlyRepository.readStreamBoundedUtf8(it, 16 * 1024 * 1024) }
+                ?: if (stream != null) throw SyncException("Réponse serveur trop volumineuse.") else ""
 
             if (code !in 200..299) {
                 val parsedMsg = runCatching {
@@ -265,9 +279,7 @@ class SupabaseSyncClient(private val repository: BizzlyRepository) {
 
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val body = stream?.let {
-                BufferedReader(InputStreamReader(it, StandardCharsets.UTF_8)).use { r -> r.readText() }
-            }.orEmpty()
+            val body = stream?.use { BizzlyRepository.readStreamBoundedUtf8(it, 2 * 1024 * 1024) }.orEmpty()
 
             if (code !in 200..299) {
                 val msg = runCatching {
@@ -316,9 +328,9 @@ class SupabaseSyncClient(private val repository: BizzlyRepository) {
                             OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8).use { w -> w.write("{}") }
                         }
                         if (conn.responseCode !in 200..299) return@runCatching null
-                        val body = BufferedReader(InputStreamReader(conn.inputStream, StandardCharsets.UTF_8)).use {
-                            it.readText()
-                        }
+                        val body = conn.inputStream.use {
+                            BizzlyRepository.readStreamBoundedUtf8(it, 4 * 1024 * 1024)
+                        } ?: return@runCatching null
                         val arr = json.parseToJsonElement(body) as? JsonArray ?: return@runCatching null
                         arr.mapNotNull { el ->
                             val o = el as? JsonObject ?: return@mapNotNull null
@@ -779,9 +791,31 @@ class SupabaseSyncClient(private val repository: BizzlyRepository) {
                 if (isDel || docEl == null || docEl is JsonNull) {
                     tbMut.remove(tableKey)
                 } else {
-                    val svId = (docEl as? JsonObject)?.get("sv")?.jsonPrimitive?.longOrNull ?: 0L
+                    val obj = docEl as? JsonObject
+                    val svId = obj?.get("sv")?.jsonPrimitive?.longOrNull ?: 0L
                     val existing = tbMut[tableKey] ?: OpenTable()
-                    tbMut[tableKey] = existing.copy(sv = svId)
+                    val compedMap = obj?.get("comped")?.let { el ->
+                        (el as? JsonObject)?.entries?.mapNotNull { (pid, v) ->
+                            val q = v.jsonPrimitive.doubleOrNull ?: return@mapNotNull null
+                            if (q > 0.0) pid to q else null
+                        }?.toMap()
+                    } ?: existing.comped
+                    val discType = obj?.get("discountType")?.jsonPrimitive?.content ?: "none"
+                    val discVal = obj?.get("discountValue")?.jsonPrimitive?.doubleOrNull ?: 0.0
+                    val discReason = obj?.get("discountReason")?.jsonPrimitive?.content.orEmpty()
+                    val paidPartial = obj?.get("paidPartial")?.jsonPrimitive?.doubleOrNull ?: 0.0
+                    val paidCount = obj?.get("paidCount")?.jsonPrimitive?.intOrNull ?: 0
+                    val splitParts = obj?.get("splitTotalParts")?.jsonPrimitive?.intOrNull ?: 0
+                    tbMut[tableKey] = existing.copy(
+                        sv = svId,
+                        comped = compedMap,
+                        discountType = if (discType == "percent" || discType == "amount") discType else "none",
+                        discountValue = if (discType == "percent" || discType == "amount") discVal.coerceAtLeast(0.0) else 0.0,
+                        discountReason = discReason,
+                        paidPartial = paidPartial.coerceAtLeast(0.0),
+                        paidCount = paidCount.coerceIn(0, 50),
+                        splitTotalParts = splitParts.coerceIn(0, 50)
+                    )
                 }
                 state.copy(tb = tbMut)
             }

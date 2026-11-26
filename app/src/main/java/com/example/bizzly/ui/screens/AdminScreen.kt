@@ -49,6 +49,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -70,6 +71,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.example.bizzly.domain.BizzlyCalculator
 import com.example.bizzly.ui.components.BizzlyCard
 import com.example.bizzly.ui.components.BusinessAvatarBox
+import com.example.bizzly.ui.components.bringIntoViewOnIme
 import com.example.bizzly.ui.theme.LocalBizzlyTokens
 import com.example.bizzly.ui.theme.SoraFontFamily
 import com.example.bizzly.ui.viewmodel.AdminBusinessSummary
@@ -181,6 +183,7 @@ private fun AdminLoginContent(
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .bringIntoViewOnIme()
                             .testTag("admin_install_code_input")
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -192,6 +195,7 @@ private fun AdminLoginContent(
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier
                             .fillMaxWidth()
+                            .bringIntoViewOnIme()
                             .testTag("admin_setup_code_input")
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -203,6 +207,7 @@ private fun AdminLoginContent(
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier
                             .fillMaxWidth()
+                            .bringIntoViewOnIme()
                             .testTag("admin_setup_confirm_input")
                     )
                     if (admin.error.isNotBlank()) {
@@ -239,6 +244,7 @@ private fun AdminLoginContent(
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier
                             .fillMaxWidth()
+                            .bringIntoViewOnIme()
                             .testTag("admin_login_code_input")
                     )
                     if (admin.error.isNotBlank()) {
@@ -276,6 +282,7 @@ private fun AdminLoginContent(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                     modifier = Modifier
                         .fillMaxWidth()
+                        .bringIntoViewOnIme()
                         .testTag("admin_supa_email_input")
                 )
                 Spacer(modifier = Modifier.height(8.dp))
@@ -287,6 +294,7 @@ private fun AdminLoginContent(
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier
                         .fillMaxWidth()
+                        .bringIntoViewOnIme()
                         .testTag("admin_supa_pwd_input")
                 )
                 if (admin.error.isNotBlank()) {
@@ -682,6 +690,7 @@ private fun AdminNetlifyPortalTab(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier
                 .fillMaxWidth()
+                .bringIntoViewOnIme()
                 .testTag("admin_netlify_url_input")
         )
         Spacer(modifier = Modifier.height(8.dp))
@@ -729,6 +738,20 @@ private fun AdminNetlifyPortalTab(
     }
 
     if (netlifyUrl.startsWith("https://", ignoreCase = true)) {
+        val allowedHost = remember(netlifyUrl) {
+            runCatching { Uri.parse(netlifyUrl).host?.lowercase() }.getOrNull()
+        }
+        DisposableEffect(netlifyUrl) {
+            onDispose {
+                webViewRef?.apply {
+                    stopLoading()
+                    clearHistory()
+                    clearCache(true)
+                    destroy()
+                }
+                webViewRef = null
+            }
+        }
         BizzlyCard {
             if (progress in 1..99) {
                 LinearProgressIndicator(
@@ -746,6 +769,13 @@ private fun AdminNetlifyPortalTab(
                         settings.domStorageEnabled = true
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
+                        @Suppress("DEPRECATION")
+                        settings.allowFileAccessFromFileURLs = false
+                        @Suppress("DEPRECATION")
+                        settings.allowUniversalAccessFromFileURLs = false
+                        @Suppress("DEPRECATION")
+                        settings.saveFormData = false
+                        settings.setSupportMultipleWindows(false)
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                         webChromeClient = object : WebChromeClient() {
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -757,8 +787,12 @@ private fun AdminNetlifyPortalTab(
                                 view: WebView?,
                                 request: WebResourceRequest?
                             ): Boolean {
-                                val target = request?.url?.toString().orEmpty()
-                                return !target.startsWith("https://", ignoreCase = true)
+                                val targetUri = request?.url ?: return true
+                                if (!targetUri.scheme.equals("https", ignoreCase = true)) return true
+                                val targetHost = targetUri.host?.lowercase() ?: return true
+                                val expected = allowedHost ?: return true
+                                val sameOrSub = targetHost == expected || targetHost.endsWith(".$expected")
+                                return !sameOrSub
                             }
                         }
                         loadUrl(netlifyUrl)

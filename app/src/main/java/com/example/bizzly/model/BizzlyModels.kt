@@ -74,6 +74,7 @@ object BizzlyPermissions {
     const val QR = "qr"
     const val RESET = "reset"
     const val RESTORE = "restore"
+    const val REMISE_GERANT = "remise_gerant"
 
     private val caissePerms = setOf(
         TABLES, COMMANDE, ENCAISSER, SUPPR, VENTES, STOCK, PRIX,
@@ -111,8 +112,35 @@ enum class BizzlyTab(val route: String, val label: String) {
     INVENTORY("inventory", "Inventaire")
 }
 
-val PAYMENT_MODES = listOf("Espèces", "Mobile Money", "Carte bancaire", "Autre")
+val PAYMENT_MODES = listOf("Espèces", "Mobile Money", "Carte bancaire", "Mixte", "Autre")
+val SINGLE_PAYMENT_MODES = listOf("Espèces", "Mobile Money", "Carte bancaire", "Autre")
 val QUICK_CASH_AMOUNTS = listOf(1000L, 2000L, 5000L, 10000L, 20000L)
+
+enum class PrinterPaperWidth(val mm: Int, val charsPerLine: Int, val label: String) {
+    MM_58(58, 32, "58 mm (32 col.)"),
+    MM_80(80, 48, "80 mm (48 col.)");
+
+    companion object {
+        fun fromMm(mm: Int): PrinterPaperWidth = if (mm >= 80) MM_80 else MM_58
+    }
+}
+
+data class BluetoothPrinterDevice(
+    val name: String,
+    val address: String
+)
+
+data class RestockOrderLine(
+    val itemId: Long,
+    val name: String,
+    val sku: String,
+    val category: String,
+    val unit: String,
+    val currentQty: Double,
+    val minThreshold: Double,
+    val suggestedQty: Double,
+    val unitPrice: Double
+)
 
 @Serializable
 data class BrandColors(
@@ -176,6 +204,12 @@ data class CashMovement(
 )
 
 @Serializable
+data class PaymentPart(
+    val mode: String,
+    val amount: Double
+)
+
+@Serializable
 data class PaidInvoice(
     val d: String,
     val t: Int,
@@ -183,7 +217,10 @@ data class PaidInvoice(
     val tot: Double,
     val m: String = "Espèces",
     val u: String = "",
-    val ts: Long = 0L
+    val ts: Long = 0L,
+    val payments: List<PaymentPart> = emptyList(),
+    val discountAmount: Double = 0.0,
+    val discountReason: String = ""
 )
 
 @Serializable
@@ -213,7 +250,14 @@ data class ArchivePeriod(
 @Serializable
 data class OpenTable(
     val sv: Long = 0L,
-    val it: Map<String, Double> = emptyMap()
+    val it: Map<String, Double> = emptyMap(),
+    val comped: Map<String, Double> = emptyMap(),
+    val discountType: String = "none",
+    val discountValue: Double = 0.0,
+    val discountReason: String = "",
+    val paidPartial: Double = 0.0,
+    val paidCount: Int = 0,
+    val splitTotalParts: Int = 0
 )
 
 @Serializable

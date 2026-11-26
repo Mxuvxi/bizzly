@@ -6,6 +6,7 @@ import com.example.bizzly.model.BrandColors
 import com.example.bizzly.model.BusinessAccount
 import com.example.bizzly.model.BusinessData
 import com.example.bizzly.model.BizzlyRole
+import com.example.bizzly.model.OpenTable
 import com.example.bizzly.model.Product
 import com.example.bizzly.model.ServerEntry
 import java.text.DecimalFormat
@@ -66,6 +67,16 @@ data class PeriodSnapshot(
     val dep: List<com.example.bizzly.model.CashMovement>,
     val vers: List<com.example.bizzly.model.CashMovement>,
     val bons: List<com.example.bizzly.model.CashMovement>
+)
+
+data class TableBillingBreakdown(
+    val grossSubtotal: Double,
+    val compedDiscount: Double,
+    val afterComped: Double,
+    val tableDiscount: Double,
+    val netTotal: Double,
+    val paidSoFar: Double,
+    val remainingDue: Double
 )
 
 object BizzlyCalculator {
@@ -302,14 +313,45 @@ object BizzlyCalculator {
         return picked
     }
 
+    fun calculateTableBreakdown(data: BusinessData, table: OpenTable): TableBillingBreakdown {
+        var gross = 0.0
+        var compedSavings = 0.0
+        for ((pidStr, rawQty) in table.it) {
+            val qty = clampNumber(rawQty).coerceAtLeast(0.0)
+            val p = productByIdStr(data, pidStr) ?: continue
+            val price = clampNumber(p.pv).coerceAtLeast(0.0)
+            gross += qty * price
+            val compQty = (table.comped[pidStr] ?: 0.0).coerceIn(0.0, qty)
+            compedSavings += compQty * price
+        }
+        val afterComped = (gross - compedSavings).coerceAtLeast(0.0)
+        val tableDisc = when (table.discountType) {
+            "percent" -> (afterComped * table.discountValue.coerceIn(0.0, 100.0) / 100.0).roundToLong().toDouble()
+            "amount" -> table.discountValue.coerceIn(0.0, afterComped)
+            else -> 0.0
+        }
+        val net = (afterComped - tableDisc).coerceAtLeast(0.0)
+        val paidSoFar = table.paidPartial.coerceIn(0.0, net)
+        val remaining = (net - paidSoFar).coerceAtLeast(0.0)
+        return TableBillingBreakdown(
+            grossSubtotal = gross,
+            compedDiscount = compedSavings,
+            afterComped = afterComped,
+            tableDiscount = tableDisc,
+            netTotal = net,
+            paidSoFar = paidSoFar,
+            remainingDue = remaining
+        )
+    }
+
     fun tableTotal(data: BusinessData, tableNum: Int): Double {
         val table = data.tb[tableNum.toString()] ?: return 0.0
-        var sum = 0.0
-        for ((pidStr, q) in table.it) {
-            val p = productByIdStr(data, pidStr) ?: continue
-            sum += clampNumber(q) * clampNumber(p.pv)
-        }
-        return sum
+        return calculateTableBreakdown(data, table).remainingDue
+    }
+
+    fun suggestedRestockQty(currentQty: Double, minThreshold: Double): Double {
+        val target = (minThreshold.coerceAtLeast(1.0) * 2.0)
+        return (target - currentQty.coerceAtLeast(0.0)).coerceAtLeast(1.0)
     }
 
     fun tableItemCount(data: BusinessData, tableNum: Int): Int {

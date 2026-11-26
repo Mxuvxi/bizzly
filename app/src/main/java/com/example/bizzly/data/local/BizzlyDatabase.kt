@@ -88,7 +88,7 @@ interface BizzlyDao {
         SyncStateEntity::class,
         InventoryItemEntity::class
     ],
-    version = 2,
+    version = 4,
     exportSchema = false
 )
 abstract class BizzlyDatabase : RoomDatabase() {
@@ -100,6 +100,18 @@ abstract class BizzlyDatabase : RoomDatabase() {
         private var instance: BizzlyDatabase? = null
 
         val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Handled in MIGRATION_3_4
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS `inventory_items`")
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
                     """
@@ -119,12 +131,8 @@ abstract class BizzlyDatabase : RoomDatabase() {
                     )
                     """.trimIndent()
                 )
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_inventory_items_businessId` ON `inventory_items` (`businessId`)"
-                )
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_inventory_items_businessId_quantity` ON `inventory_items` (`businessId`, `quantity`)"
-                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_inventory_items_businessId` ON `inventory_items` (`businessId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_inventory_items_businessId_quantity` ON `inventory_items` (`businessId`, `quantity`)")
             }
         }
 
@@ -135,7 +143,7 @@ abstract class BizzlyDatabase : RoomDatabase() {
                     BizzlyDatabase::class.java,
                     "bizzly_local.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { instance = it }
             }

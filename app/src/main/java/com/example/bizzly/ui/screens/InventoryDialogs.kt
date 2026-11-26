@@ -8,233 +8,268 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.bizzly.data.local.InventoryItemEntity
 import com.example.bizzly.domain.BizzlyCalculator
+import com.example.bizzly.model.RestockOrderLine
+import com.example.bizzly.ui.components.bringIntoViewOnIme
 import com.example.bizzly.ui.theme.LocalBizzlyTokens
 import com.example.bizzly.ui.theme.SoraFontFamily
 
-private val inventoryCategories = listOf("Boissons", "Cuisine", "Fournitures", "Emballages", "Général")
-private val inventoryUnits = listOf("unités", "bouteilles", "kg", "litres", "cartons")
-
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun InventoryItemFormDialog(
-    editingItem: InventoryItemEntity?,
+fun InventoryItemEditorDialog(
+    initial: InventoryItemEntity?,
     defaultThreshold: Int,
-    onDismiss: () -> Unit,
     onSave: (
-        editingId: Long?,
+        id: Long?,
         name: String,
         sku: String,
         category: String,
         unit: String,
-        quantity: String,
-        minThreshold: String,
-        unitPrice: String,
+        quantity: Double,
+        minThreshold: Double,
+        unitPrice: Double,
         notes: String
-    ) -> Unit
+    ) -> Unit,
+    onDismiss: () -> Unit
 ) {
     val tokens = LocalBizzlyTokens.current
-    var name by remember(editingItem) { mutableStateOf(editingItem?.name.orEmpty()) }
-    var sku by remember(editingItem) { mutableStateOf(editingItem?.sku.orEmpty()) }
-    var category by remember(editingItem) { mutableStateOf(editingItem?.category ?: "Général") }
-    var unit by remember(editingItem) { mutableStateOf(editingItem?.unit ?: "unités") }
-    var quantity by remember(editingItem) {
-        mutableStateOf(editingItem?.let { BizzlyCalculator.formatQty(it.quantity) } ?: "0")
+    val focusManager = LocalFocusManager.current
+
+    var name by remember(initial) { mutableStateOf(initial?.name.orEmpty()) }
+    var category by remember(initial) { mutableStateOf(initial?.category.orEmpty()) }
+    var unit by remember(initial) { mutableStateOf(initial?.unit?.ifBlank { "unité" } ?: "unité") }
+    var sku by remember(initial) { mutableStateOf(initial?.sku.orEmpty()) }
+    var qtyText by remember(initial) {
+        mutableStateOf(initial?.let { BizzlyCalculator.formatQty(it.quantity) } ?: "0")
     }
-    var minThreshold by remember(editingItem, defaultThreshold) {
+    var thresholdText by remember(initial) {
         mutableStateOf(
-            editingItem?.let { BizzlyCalculator.formatQty(it.minThreshold) }
-                ?: defaultThreshold.toString()
+            initial?.let { BizzlyCalculator.formatQty(it.minThreshold) }
+                ?: defaultThreshold.coerceAtLeast(1).toString()
         )
     }
-    var unitPrice by remember(editingItem) {
+    var priceText by remember(initial) {
         mutableStateOf(
-            if (editingItem == null || editingItem.unitPrice == 0.0) ""
-            else BizzlyCalculator.formatQty(editingItem.unitPrice)
+            initial?.unitPrice?.takeIf { it > 0.0 }?.let {
+                if (it % 1.0 == 0.0) it.toLong().toString() else it.toString()
+            } ?: ""
         )
     }
-    var notes by remember(editingItem) { mutableStateOf(editingItem?.notes.orEmpty()) }
+    var notes by remember(initial) { mutableStateOf(initial?.notes.orEmpty()) }
+    var errorText by remember { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = tokens.card,
         title = {
             Text(
-                text = if (editingItem == null) "Nouvel article d’inventaire" else "Modifier l’article",
-                fontFamily = SoraFontFamily,
-                fontWeight = FontWeight.Bold,
+                text = if (initial == null) "Nouvel article en stock" else "Modifier l’article",
+                style = MaterialTheme.typography.titleMedium,
                 color = tokens.text
             )
         },
         text = {
             Column(
                 modifier = Modifier
-                    .widthIn(max = 460.dp)
+                    .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("Nom de l’article *") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("inv_form_name_input")
+                        .bringIntoViewOnIme()
+                        .testTag("inv_editor_name_input")
                 )
-
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = quantity,
-                        onValueChange = { quantity = it },
-                        label = { Text("Quantité actuelle") },
+                        value = category,
+                        onValueChange = { category = it },
+                        label = { Text("Catégorie") },
                         singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
                         modifier = Modifier
                             .weight(1f)
-                            .testTag("inv_form_qty_input")
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_category_input")
                     )
                     OutlinedTextField(
-                        value = minThreshold,
-                        onValueChange = { minThreshold = it },
-                        label = { Text("Seuil d’alerte") },
+                        value = unit,
+                        onValueChange = { unit = it },
+                        label = { Text("Unité") },
                         singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
                         modifier = Modifier
-                            .weight(1f)
-                            .testTag("inv_form_threshold_input")
+                            .weight(0.85f)
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_unit_input")
                     )
                 }
-
-                Text("Catégorie", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = tokens.muted)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    inventoryCategories.forEach { cat ->
-                        FilterChip(
-                            selected = category.equals(cat, ignoreCase = true),
-                            onClick = { category = cat },
-                            label = { Text(cat, fontSize = 12.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = tokens.tint,
-                                selectedLabelColor = tokens.accentReadable
-                            )
-                        )
-                    }
-                }
-
-                Text("Unité de mesure", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = tokens.muted)
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    inventoryUnits.forEach { u ->
-                        FilterChip(
-                            selected = unit.equals(u, ignoreCase = true),
-                            onClick = { unit = u },
-                            label = { Text(u, fontSize = 12.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = tokens.tint,
-                                selectedLabelColor = tokens.accentReadable
-                            )
-                        )
-                    }
-                }
-
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = unitPrice,
-                        onValueChange = { unitPrice = it },
-                        label = { Text("Prix unitaire (FCFA)") },
+                        value = qtyText,
+                        onValueChange = { qtyText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = { Text("Quantité *") },
                         singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
                         modifier = Modifier
                             .weight(1f)
-                            .testTag("inv_form_price_input")
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_qty_input")
+                    )
+                    OutlinedTextField(
+                        value = thresholdText,
+                        onValueChange = { thresholdText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = { Text("Seuil d’alerte *") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
+                        modifier = Modifier
+                            .weight(1f)
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_threshold_input")
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = priceText,
+                        onValueChange = { priceText = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = { Text("Prix unitaire (F)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
+                        modifier = Modifier
+                            .weight(1f)
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_price_input")
                     )
                     OutlinedTextField(
                         value = sku,
                         onValueChange = { sku = it },
-                        label = { Text("Réf. / SKU") },
+                        label = { Text("Réf / SKU") },
                         singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Down) }),
                         modifier = Modifier
-                            .weight(1f)
-                            .testTag("inv_form_sku_input")
+                            .weight(0.9f)
+                            .bringIntoViewOnIme()
+                            .testTag("inv_editor_sku_input")
                     )
                 }
-
                 OutlinedTextField(
                     value = notes,
                     onValueChange = { notes = it },
-                    label = { Text("Notes / fournisseur (facultatif)") },
-                    maxLines = 2,
+                    label = { Text("Notes (fournisseur, casier…)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("inv_form_notes_input")
+                        .bringIntoViewOnIme()
+                        .testTag("inv_editor_notes_input")
                 )
+                if (errorText.isNotBlank()) {
+                    Text(errorText, color = tokens.ko, fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    onSave(editingItem?.id, name, sku, category, unit, quantity, minThreshold, unitPrice, notes)
+                    val cleanName = name.trim()
+                    val qty = qtyText.toDoubleOrNull()
+                    val thresh = thresholdText.toDoubleOrNull()
+                    if (cleanName.isEmpty()) {
+                        errorText = "Entrez un nom d’article."
+                        return@Button
+                    }
+                    if (qty == null || qty < 0.0) {
+                        errorText = "Quantité invalide."
+                        return@Button
+                    }
+                    if (thresh == null || thresh < 0.0) {
+                        errorText = "Seuil invalide."
+                        return@Button
+                    }
+                    onSave(
+                        initial?.id,
+                        cleanName,
+                        sku.trim(),
+                        category.trim(),
+                        unit.trim().ifBlank { "unité" },
+                        qty,
+                        thresh,
+                        priceText.toDoubleOrNull()?.coerceAtLeast(0.0) ?: 0.0,
+                        notes.trim()
+                    )
                 },
-                enabled = name.trim().isNotEmpty(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = tokens.primary,
                     contentColor = tokens.onPrimary
                 ),
-                modifier = Modifier
-                    .height(48.dp)
-                    .testTag("inv_form_save_btn")
+                modifier = Modifier.testTag("inv_editor_save_btn")
             ) {
-                Text(if (editingItem == null) "Ajouter" else "Enregistrer")
+                Text("Enregistrer")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss, modifier = Modifier.height(48.dp)) {
+            TextButton(onClick = onDismiss) {
                 Text("Annuler", color = tokens.muted)
             }
         }
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun InventoryQuickAdjustDialog(
+fun InventoryQuickQtyDialog(
     item: InventoryItemEntity,
-    onDismiss: () -> Unit,
-    onConfirm: (qtyRaw: String, thresholdRaw: String) -> Unit
+    onApplyExact: (Double) -> Unit,
+    onDismiss: () -> Unit
 ) {
     val tokens = LocalBizzlyTokens.current
-    var qtyText by remember(item.id) { mutableStateOf(BizzlyCalculator.formatQty(item.quantity)) }
-    var thresholdText by remember(item.id) { mutableStateOf(BizzlyCalculator.formatQty(item.minThreshold)) }
+    var qtyText by remember(item.id, item.quantity) {
+        mutableStateOf(BizzlyCalculator.formatQty(item.quantity))
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -242,59 +277,217 @@ fun InventoryQuickAdjustDialog(
         title = {
             Text(
                 text = item.name,
-                fontFamily = SoraFontFamily,
-                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleMedium,
                 color = tokens.text
             )
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "Ajustez la quantité exacte en stock (${item.unit}) et le seuil déclenchant l’alerte.",
+                    text = "Seuil d’alerte : ${BizzlyCalculator.formatQty(item.minThreshold)} ${item.unit}",
                     fontSize = 13.sp,
                     color = tokens.muted
                 )
-                Spacer(modifier = Modifier.height(2.dp))
                 OutlinedTextField(
                     value = qtyText,
-                    onValueChange = { qtyText = it },
+                    onValueChange = { qtyText = it.filter { ch -> ch.isDigit() || ch == '.' } },
                     label = { Text("Quantité (${item.unit})") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier
                         .fillMaxWidth()
+                        .bringIntoViewOnIme()
                         .testTag("inv_quick_qty_input")
                 )
-                OutlinedTextField(
-                    value = thresholdText,
-                    onValueChange = { thresholdText = it },
-                    label = { Text("Seuil d’alerte (${item.unit})") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("inv_quick_threshold_input")
-                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(-5, -1, 1, 5, 10).forEach { delta ->
+                        OutlinedButton(
+                            onClick = {
+                                val cur = qtyText.toDoubleOrNull() ?: 0.0
+                                qtyText = BizzlyCalculator.formatQty((cur + delta).coerceAtLeast(0.0))
+                            },
+                            modifier = Modifier.height(48.dp)
+                        ) {
+                            Text(
+                                text = if (delta > 0) "+$delta" else "$delta",
+                                color = if (delta < 0) tokens.ko else tokens.accentReadable,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onConfirm(qtyText, thresholdText) },
+                onClick = {
+                    val parsed = qtyText.toDoubleOrNull()?.coerceAtLeast(0.0) ?: 0.0
+                    onApplyExact(parsed)
+                },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = tokens.primary,
                     contentColor = tokens.onPrimary
                 ),
-                modifier = Modifier
-                    .height(48.dp)
-                    .testTag("inv_quick_save_btn")
+                modifier = Modifier.testTag("inv_quick_qty_apply_btn")
             ) {
                 Text("Valider")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss, modifier = Modifier.height(48.dp)) {
+            TextButton(onClick = onDismiss) {
                 Text("Annuler", color = tokens.muted)
             }
         }
     )
 }
+
+@Composable
+fun RestockOrderDialog(
+    lowStockItems: List<InventoryItemEntity>,
+    onExportPdf: (supplierName: String, lines: List<RestockOrderLine>) -> Unit,
+    onExportExcel: (supplierName: String, lines: List<RestockOrderLine>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val tokens = LocalBizzlyTokens.current
+    var supplierName by remember { mutableStateOf("") }
+    val qtyInputs = remember(lowStockItems) {
+        mutableStateMapOf<Long, String>().apply {
+            lowStockItems.forEach { item ->
+                val sug = BizzlyCalculator.suggestedRestockQty(item.quantity, item.minThreshold)
+                put(item.id, BizzlyCalculator.formatQty(sug))
+            }
+        }
+    }
+
+    val currentLines = lowStockItems.mapNotNull { item ->
+        val qty = qtyInputs[item.id]?.toDoubleOrNull()?.coerceAtLeast(0.0) ?: 0.0
+        if (qty <= 0.0) null else RestockOrderLine(
+            itemId = item.id,
+            name = item.name,
+            sku = item.sku,
+            category = item.category,
+            unit = item.unit,
+            currentQty = item.quantity,
+            minThreshold = item.minThreshold,
+            suggestedQty = qty,
+            unitPrice = item.unitPrice
+        )
+    }
+    val estTotal = currentLines.sumOf { (it.suggestedQty * it.unitPrice).coerceAtLeast(0.0) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = tokens.card,
+        title = {
+            Text(
+                text = "Bon de commande fournisseur",
+                style = MaterialTheme.typography.titleMedium,
+                color = tokens.text
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Objectif conseillé : 2× le seuil minimal. Ajustez les quantités avant export.",
+                    fontSize = 12.5.sp,
+                    color = tokens.muted
+                )
+                OutlinedTextField(
+                    value = supplierName,
+                    onValueChange = { supplierName = it },
+                    label = { Text("Nom du fournisseur (optionnel)") },
+                    placeholder = { Text("Ex. Brasserie / Grossiste…") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .bringIntoViewOnIme()
+                        .testTag("restock_supplier_input")
+                )
+
+                HorizontalDivider(color = tokens.border)
+
+                lowStockItems.forEach { item ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(item.name, fontWeight = FontWeight.SemiBold, color = tokens.text, fontSize = 13.5.sp)
+                            Text(
+                                text = "Stock ${BizzlyCalculator.formatQty(item.quantity)} / seuil ${BizzlyCalculator.formatQty(item.minThreshold)} ${item.unit}",
+                                fontSize = 11.5.sp,
+                                color = if (item.quantity <= 0.0) tokens.ko else tokens.warn
+                            )
+                        }
+                        OutlinedTextField(
+                            value = qtyInputs[item.id] ?: "0",
+                            onValueChange = { raw ->
+                                qtyInputs[item.id] = raw.filter { ch -> ch.isDigit() || ch == '.' }
+                            },
+                            label = { Text("Qté", fontSize = 11.sp) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                            modifier = Modifier
+                                .width(86.dp)
+                                .bringIntoViewOnIme()
+                                .testTag("restock_qty_${item.id}")
+                        )
+                    }
+                }
+
+                if (estTotal > 0.0) {
+                    HorizontalDivider(color = tokens.border)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Estimation (${currentLines.size} lignes)", fontSize = 13.sp, color = tokens.muted)
+                        Text(
+                            text = BizzlyCalculator.formatFcfa(estTotal),
+                            fontFamily = SoraFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = tokens.accentReadable
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { onExportExcel(supplierName.trim(), currentLines) },
+                    enabled = currentLines.isNotEmpty(),
+                    modifier = Modifier.testTag("restock_export_excel_btn")
+                ) {
+                    Text("Excel", color = tokens.text)
+                }
+                Button(
+                    onClick = { onExportPdf(supplierName.trim(), currentLines) },
+                    enabled = currentLines.isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = tokens.primary,
+                        contentColor = tokens.onPrimary
+                    ),
+                    modifier = Modifier.testTag("restock_export_pdf_btn")
+                ) {
+                    Text("PDF")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Fermer", color = tokens.muted)
+            }
+        }
+    )
+}
+
